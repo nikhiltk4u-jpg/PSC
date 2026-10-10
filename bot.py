@@ -1,12 +1,19 @@
+import io
 import os
 import re
 import sys
 import time
+import json
+import base64
+import hashlib
+import threading
 from datetime import datetime, timedelta, timezone
 import urllib3
 import requests
 from bs4 import BeautifulSoup
+from flask import Flask
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import fitz  # PyMuPDF
 from urllib.parse import urljoin, quote
 
@@ -30,18 +37,27 @@ elif not raw_chat_id.startswith("@") and not raw_chat_id.startswith("-"):
 else:
     CHAT_ID = raw_chat_id
 
+# GitHub API Auto-Backup Settings (Set in Render Environment Variables)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "nikhiltk4u-jpg/PSC").strip()
+
 CHANNEL_LINK = "t.me/topkeralapsc"
 CHANNEL_URL = "https://t.me/topkeralapsc"
 HISTORY_FILE = "posted_links.txt"
+PDF_MAP_FILE = "posted_data.json"
 
 SEED_LIMIT_PER_CATEGORY = 2
 MAX_NOTIFICATIONS_PER_RUN = 4
+SCRAPE_INTERVAL_SECONDS = 1800  # Checks Kerala PSC every 30 minutes
 
 if not BOT_TOKEN:
-    print("❌ FATAL ERROR: BOT_TOKEN is empty! Check GitHub Secrets.")
+    print("❌ FATAL ERROR: BOT_TOKEN is empty!")
     sys.exit(1)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+BOT_USERNAME = bot.get_me().username
+
+app = Flask(__name__)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -80,8 +96,203 @@ KERALA_DISTRICTS = [
     "Wayanad", "Kannur", "Kasaragod", "Kasargod", "Statewide"
 ]
 
+# In-memory storage for 0.001s instant lookups and zero disk wear
+MEMORY_PDF_MAP = {}
+MEMORY_POSTED_LINKS = set()
 
-# ================= 1. TIME & DATE HELPERS (IST) =================
+
+# ================= 1. ZERO-STORAGE MEMORY + GITHUB CLOUD SYNC =================
+def init_storage():
+    global MEMORY_PDF_MAP, MEMORY_POSTED_LINKS
+    if os.path.exists(PDF_MAP_FILE):
+        try:
+            with open(PDF_MAP_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    MEMORY_PDF_MAP.update(data)
+        except Exception:
+            pass
+
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                MEMORY_POSTED_LINKS.update(line.strip() for line in f if line.strip())
+        except Exception:
+            pass
+
+
+def push_file_to_github_api(filepath, commit_msg):
+    """Automatically backs up posted_links.txt & posted_data.json to your GitHub repo."""
+    if not GITHUB_TOKEN or not os.path.exists(filepath):
+        return
+    try:
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filepath}"
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        r = requests.get(api_url, headers=headers, timeout=15)
+        sha = r.json().get("sha") if r.status_code == 200 else None
+
+        with open(filepath, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        payload = {"message": commit_msg, "content": content_b64}
+        if sha:
+            payload["sha"] = sha
+
+        requests.put(api_url, headers=headers, json=payload, timeout=15)
+        print(f"[+] Synced {filepath} to GitHub repo {GITHUB_REPO}!")
+    except Exception as e:
+        print(f"[!] GitHub API sync notice: {e}")
+
+
+def save_pdf_entry(file_id, pdf_url, filename, title):
+    MEMORY_PDF_MAP[file_id] = {
+        "url": pdf_url,
+        "filename": filename.replace("_@topkeralapsc", "_NoWatermark"),
+        "title": title
+    }
+    if len(MEMORY_PDF_MAP) > 500:
+        for k in list(MEMORY_PDF_MAP.keys())[:-500]:
+            MEMORY_PDF_MAP.pop(k, None)
+
+    try:
+        with open(PDF_MAP_FILE, "w", encoding="utf-8") as f:
+            json.dump(MEMORY_PDF_MAP, f, indent=2)
+    except Exception:
+        pass
+
+
+def save_posted_link(link):
+    MEMORY_POSTED_LINKS.add(link)
+    try:
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{link}\n")
+    except Exception:
+        pass
+
+
+def make_file_id(pdf_url):
+    return hashlib.md5(pdf_url.encode("utf-8")).hexdigest()[:10]
+
+
+# ================= 2. INSTANT 0.1s FORCE-SUBSCRIBE & RAM STREAMING =================
+def is_user_subscribed(user_id):
+    try:
+        member = bot.get_chat_member(CHAT_ID, user_id)
+        return member.status in ["creator", "administrator", "member"]
+    except Exception as e:
+        print(f"[!] Membership check error for {user_id}: {e}")
+        return False
+
+
+def send_clean_pdf_to_user_zero_storage(user_id, file_id):
+    """Streams the un-watermarked PDF directly in RAM (io.BytesIO) -> 0 bytes written to disk!"""
+    entry = MEMORY_PDF_MAP.get(file_id)
+    if not entry:
+        bot.send_message(
+            user_id,
+            "⚠️ Could not find this PDF in memory. Please tap the button on any recent post in @topkeralapsc!"
+        )
+        return
+
+    status_msg = bot.send_message(
+        user_id,
+        f"✅ <b>Verified Subscriber of @topkeralapsc!</b>\n⏳ <i>Sending your clean (No-Watermark) PDF for:</i>\n<b>{entry['title']}</b>...",
+        parse_mode="HTML"
+    )
+
+    pdf_bytes = fetch_url(entry["url"], is_pdf=True)
+    if pdf_bytes and pdf_bytes.startswith(b"%PDF"):
+        try:
+            pdf_stream = io.BytesIO(pdf_bytes)
+            pdf_stream.name = entry["filename"]
+
+            bot.send_document(
+                chat_id=user_id,
+                document=pdf_stream,
+                visible_file_name=entry["filename"],
+                caption=(
+                    f"✅ <b>Official Un-Watermarked PDF</b>\n"
+                    f"📌 <b>Document:</b> {entry['title']}\n\n"
+                    f"❤️ <i>Thank you for being a subscriber of @topkeralapsc!</i>"
+                ),
+                parse_mode="HTML"
+            )
+            try:
+                bot.delete_message(user_id, status_msg.message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[!] Stream send error: {e}")
+    else:
+        dl_markup = InlineKeyboardMarkup()
+        dl_markup.add(InlineKeyboardButton("📥 Click to Open Clean PDF", url=entry["url"]))
+        bot.send_message(
+            user_id,
+            "✅ <b>Verified Subscriber!</b>\nTap below to open your un-watermarked PDF directly:",
+            parse_mode="HTML",
+            reply_markup=dl_markup
+        )
+
+
+@bot.message_handler(commands=["start"])
+def handle_start_command(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    if text.startswith("/start dl_"):
+        file_id = text.replace("/start dl_", "").strip()
+
+        if not is_user_subscribed(user_id):
+            join_markup = InlineKeyboardMarkup(row_width=1)
+            join_markup.add(
+                InlineKeyboardButton("📢 Step 1: Join @topkeralapsc", url=CHANNEL_URL),
+                InlineKeyboardButton("🔓 Step 2: I Joined — Send Clean PDF", callback_data=f"dmcheck_{file_id}")
+            )
+            bot.send_message(
+                user_id,
+                "❌ <b>ACCESS DENIED — SUBSCRIPTION REQUIRED!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "To download the <b>Un-Watermarked PDF</b>, you must be a subscriber of <b>@topkeralapsc</b>.\n\n"
+                "1️⃣ Tap <b>Step 1</b> below to join the channel\n"
+                "2️⃣ Give a ❤️ or 👍 reaction on the post\n"
+                "3️⃣ Tap <b>Step 2</b> below for instant delivery!",
+                parse_mode="HTML",
+                reply_markup=join_markup
+            )
+            return
+
+        send_clean_pdf_to_user_zero_storage(user_id, file_id)
+    else:
+        bot.send_message(
+            user_id,
+            "👋 <b>Welcome to the Official @topkeralapsc Bot!</b>\n\n"
+            "Tap the <b>❤️ React & Download PDF (No Watermark)</b> button below any post in "
+            "<a href='https://t.me/topkeralapsc'>@topkeralapsc</a> to receive the un-watermarked PDF instantly!",
+            parse_mode="HTML"
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("dmcheck_"))
+def handle_dm_recheck_button(call):
+    user_id = call.from_user.id
+    file_id = call.data.replace("dmcheck_", "").strip()
+
+    if not is_user_subscribed(user_id):
+        bot.answer_callback_query(
+            call.id,
+            text="❌ You still haven't joined @topkeralapsc! Tap 'Step 1: Join @topkeralapsc' first.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(call.id, text="✅ Subscription Verified! Sending your Clean PDF...")
+    send_clean_pdf_to_user_zero_storage(user_id, file_id)
+
+
+# ================= 3. TIME & DATE HELPERS (IST) =================
 def get_ist_today():
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist_tz).date()
@@ -99,7 +310,7 @@ def get_days_until_deadline(date_str):
         return 999
 
 
-# ================= 2. FETCH WITH PROXY FALLBACK =================
+# ================= 4. FETCH WITH PROXY FALLBACK =================
 def fetch_url(url, is_pdf=False):
     try:
         r = requests.get(url, headers=HEADERS, verify=False, timeout=20)
@@ -119,23 +330,18 @@ def fetch_url(url, is_pdf=False):
     return None
 
 
-# ================= 3. CRASH-PROOF PREMIUM PDF WATERMARKING =================
-def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
-    """
-    Uses 100% built-in 'helv' font and exact text-width centering so it NEVER crashes:
-    1. Top-Center Rounded Pill Badge (Clickable)
-    2. Bottom-Center Solid Pill Badge (Clickable)
-    3. Dead-Center 45° Upward (/) Diagonal Watermark (Soft 0.14 opacity)
-    """
+# ================= 5. ZERO-DISK RAM PDF WATERMARKING =================
+def watermark_pdf_in_ram(pdf_bytes):
+    """Applies Top-Center Pill, Bottom-Center Pill, and 45° Upward Center Watermark in RAM."""
     try:
-        doc = fitz.open(input_pdf_path)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for page in doc:
             page.clean_contents()
             rect = page.rect
             w, h = rect.width, rect.height
             cx, cy = w / 2.0, h / 2.0
 
-            # --- 1. TOP-CENTER PREMIUM PILL BADGE ---
+            # 1. Top-Center Rounded Pill Badge
             top_text = "TELEGRAM CHANNEL: @topkeralapsc  |  Click to Join: t.me/topkeralapsc"
             top_fs = 8.5
             top_tw = fitz.get_text_length(top_text, fontname="helv", fontsize=top_fs)
@@ -160,7 +366,7 @@ def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": top_box, "uri": CHANNEL_URL})
 
-            # --- 2. BOTTOM-CENTER PREMIUM PILL BADGE ---
+            # 2. Bottom-Center Solid Pill Badge
             bot_text = "JOIN TELEGRAM FOR KERALA PSC UPDATES:  t.me/topkeralapsc  (CLICK HERE)"
             bot_fs = 8.5
             bot_tw = fitz.get_text_length(bot_text, fontname="helv", fontsize=bot_fs)
@@ -185,7 +391,7 @@ def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": bottom_box, "uri": CHANNEL_URL})
 
-            # --- 3. CENTER 45° UPWARD (/) DIAGONAL WATERMARK ---
+            # 3. Center 45° Upward (/) Diagonal Watermark
             wm_line1 = "TELEGRAM: @topkeralapsc"
             wm_line2 = "https://t.me/topkeralapsc"
             wm_fs = 26
@@ -215,16 +421,15 @@ def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
                 overlay=True
             )
 
-        doc.save(output_pdf_path)
+        out_bytes = doc.tobytes()
         doc.close()
-        print("[+] Watermark applied successfully!")
-        return True
+        return out_bytes
     except Exception as e:
         print(f"❌ Watermark error: {e}")
-        return False
+        return pdf_bytes
 
 
-# ================= 4. CLEAN STRUCTURED DETAILS PARSER =================
+# ================= 6. CLEAN STRUCTURED DETAILS PARSER =================
 def clean_text(text):
     return " ".join(text.split())
 
@@ -234,7 +439,6 @@ def format_structured_details(item, doc_type_display):
     tag = item["short_tag"]
     lines = []
 
-    # --- CASE 1: LIVE JOB NOTIFICATION ---
     if tag == "JobNotification":
         post_raw = item.get("post_title", raw.split("|")[0]).strip()
         gaz_date = item.get("gaz_date", "")
@@ -262,7 +466,6 @@ def format_structured_details(item, doc_type_display):
         lines.append("🖥 <b>Apply Online:</b> <a href='https://thulasi.psc.kerala.gov.in/thulasi/'>Kerala PSC Thulasi Portal</a>")
         return "\n".join(lines), clean_post
 
-    # --- CASE 2: QUESTION PAPER & OMR ANSWER KEY ---
     if tag == "OMR":
         qp_code = re.search(r"Question Paper Code\s*:\s*(.*?)(?=Question Paper Medium|Category Code|$)", raw, re.I)
         medium = re.search(r"Question Paper Medium\s*:\s*(.*?)(?=Category Code|Name Of Post|$)", raw, re.I)
@@ -292,7 +495,6 @@ def format_structured_details(item, doc_type_display):
         lines.append(f"📄 <b>Document:</b> {doc_type_display}")
         return "\n".join(lines), post_name
 
-    # --- CASE 3: RANKED LIST & SHORT LIST ---
     cleaned = re.sub(r"\b20\d{2}\s*,\s*", "", raw)
     cleaned = re.sub(r"Featured\s*Latest\s*,?", "", cleaned, flags=re.I)
 
@@ -339,7 +541,7 @@ def format_structured_details(item, doc_type_display):
     return "\n".join(lines), post_name
 
 
-# ================= 5. COMPACT FILENAME BUILDER =================
+# ================= 7. COMPACT FILENAME BUILDER =================
 def build_clean_filename(post_name, short_tag, label):
     clean_exam = re.sub(r"[^A-Za-z0-9]+", "_", post_name).strip("_")
     words = [w.capitalize() for w in clean_exam.split("_") if w]
@@ -362,10 +564,9 @@ def build_clean_filename(post_name, short_tag, label):
     return f"{short_exam}_{doc_tag}_@topkeralapsc.pdf"
 
 
-# ================= 6. LIVE JOB NOTIFICATIONS + DEADLINE REMINDERS =================
-def scrape_notifications_and_send_reminders(posted_links):
+# ================= 8. LIVE JOB NOTIFICATIONS + DEADLINE REMINDERS =================
+def scrape_notifications_and_send_reminders():
     active_notifications = []
-    print(f"[*] Checking Live Job Notifications & Deadlines at {NOTIFICATIONS_URL}...")
     html = fetch_url(NOTIFICATIONS_URL, is_pdf=False)
     if not html:
         return active_notifications
@@ -400,8 +601,6 @@ def scrape_notifications_and_send_reminders(posted_links):
                 "url": gazette_url
             })
 
-    print(f"    -> Found {len(active_gazettes)} currently open Gazette(s).")
-
     for gaz in active_gazettes:
         sub_html = fetch_url(gaz["url"], is_pdf=False)
         post_names_list = []
@@ -433,10 +632,9 @@ def scrape_notifications_and_send_reminders(posted_links):
         days_left = gaz["days_left"]
         if days_left in (0, 1):
             reminder_key = f"REMINDER_{days_left}DAY_{gaz['url']}"
-            if reminder_key not in posted_links:
+            if reminder_key not in MEMORY_POSTED_LINKS:
                 send_deadline_warning_alert(gaz, post_names_list, days_left)
                 save_posted_link(reminder_key)
-                posted_links.add(reminder_key)
 
     return active_notifications
 
@@ -481,7 +679,7 @@ def send_deadline_warning_alert(gaz, post_names_list, days_left):
         print(f"[!] Failed to send deadline reminder: {e}")
 
 
-# ================= 7. STANDARD TABLE SCRAPER =================
+# ================= 9. STANDARD TABLE SCRAPER =================
 def scrape_table_items(source):
     items = []
     html = fetch_url(source["url"], is_pdf=False)
@@ -524,23 +722,16 @@ def scrape_table_items(source):
     return items
 
 
-# ================= 8. DOWNLOAD, WATERMARK & SEND =================
+# ================= 10. ZERO-DISK RAM WATERMARK & SEND =================
 def download_and_send_pdf(item, label, pdf_url):
-    raw_file = "temp_raw.pdf"
-    watermarked_file = "temp_watermarked.pdf"
-
     try:
-        print(f"[*] Downloading PDF: {pdf_url}")
+        print(f"[*] Downloading PDF in RAM: {pdf_url}")
         pdf_bytes = fetch_url(pdf_url, is_pdf=True)
         if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
             print(f"[!] Invalid PDF download: {pdf_url}")
             return False
 
-        with open(raw_file, "wb") as f:
-            f.write(pdf_bytes)
-
-        watermarked_ok = add_watermark_to_pdf(raw_file, watermarked_file)
-        file_to_send = watermarked_file if watermarked_ok else raw_file
+        watermarked_bytes = watermark_pdf_in_ram(pdf_bytes)
 
         if item["short_tag"] == "JobNotification":
             doc_type_display = "Official Gazette Notification PDF"
@@ -556,7 +747,9 @@ def download_and_send_pdf(item, label, pdf_url):
         formatted_body, extracted_post_name = format_structured_details(item, doc_type_display)
         custom_filename = build_clean_filename(extracted_post_name, item["short_tag"], label)
 
-        # Extra blank line (\n\n) before the footer separator
+        file_id = make_file_id(pdf_url)
+        save_pdf_entry(file_id, pdf_url, custom_filename, f"{extracted_post_name} ({doc_type_display})")
+
         caption = (
             f"{item['emoji']} <b>KERALA PSC {item['category']}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -567,16 +760,31 @@ def download_and_send_pdf(item, label, pdf_url):
             f"{item['hashtag']}"
         )
 
-        with open(file_to_send, "rb") as doc_file:
-            bot.send_document(
-                chat_id=CHAT_ID,
-                document=doc_file,
-                visible_file_name=custom_filename,
-                caption=caption,
-                parse_mode="HTML"
-            )
+        markup = InlineKeyboardMarkup(row_width=1)
+        btn_unlock_clean = InlineKeyboardButton(
+            text="❤️ React & Download PDF (No Watermark)",
+            url=f"https://t.me/{BOT_USERNAME}?start=dl_{file_id}"
+        )
+        share_text = quote("🔥 Join @topkeralapsc for Instant Kerala PSC Rank Lists, Question Papers, Answer Keys & Job Notifications!")
+        btn_share = InlineKeyboardButton(
+            text="📢 Share @topkeralapsc with Friends",
+            url=f"https://t.me/share/url?url={quote(CHANNEL_URL)}&text={share_text}"
+        )
+        markup.add(btn_unlock_clean, btn_share)
 
-        print(f"[+] Posted: {custom_filename}")
+        doc_stream = io.BytesIO(watermarked_bytes)
+        doc_stream.name = custom_filename
+
+        bot.send_document(
+            chat_id=CHAT_ID,
+            document=doc_stream,
+            visible_file_name=custom_filename,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+
+        print(f"[+] Posted from RAM: {custom_filename}")
         time.sleep(3)
         return True
 
@@ -584,68 +792,75 @@ def download_and_send_pdf(item, label, pdf_url):
         print(f"[!] Error sending PDF: {e}")
         return False
 
-    finally:
-        for f in [raw_file, watermarked_file]:
-            if os.path.exists(f):
-                os.remove(f)
 
-
-def load_posted_links():
-    if not os.path.exists(HISTORY_FILE):
-        return set()
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
-
-
-def save_posted_link(link):
-    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{link}\n")
-
-
-def main():
-    posted_links = load_posted_links()
-    is_first_run = len(posted_links) == 0
+def run_scraper_cycle():
+    is_first_run = len(MEMORY_POSTED_LINKS) == 0
     total_sent = 0
 
-    # --- PART A: LIVE JOB NOTIFICATIONS + DEADLINE REMINDERS ---
-    live_notifications = scrape_notifications_and_send_reminders(posted_links)
-    print(f"    -> Total individual live Job Notification PDFs found: {len(live_notifications)}")
-
+    live_notifications = scrape_notifications_and_send_reminders()
     notif_sent = 0
     for item in live_notifications:
         if notif_sent >= MAX_NOTIFICATIONS_PER_RUN:
             break
         for label, pdf_url in item["pdfs"]:
-            if pdf_url not in posted_links:
+            if pdf_url not in MEMORY_POSTED_LINKS:
                 if download_and_send_pdf(item, label, pdf_url):
                     save_posted_link(pdf_url)
-                    posted_links.add(pdf_url)
                     notif_sent += 1
                     total_sent += 1
 
-    # --- PART B: RANK LISTS, QUESTION PAPERS, ANSWER KEYS, SHORT LISTS ---
     for source in SOURCES:
-        print(f"[*] Scraping {source['name']}...")
         items = scrape_table_items(source)
-        print(f"    -> Found {len(items)} items.")
-
         limit = SEED_LIMIT_PER_CATEGORY if is_first_run else 5
         for item in reversed(items[:limit]):
             for label, pdf_url in item["pdfs"]:
-                if pdf_url not in posted_links:
+                if pdf_url not in MEMORY_POSTED_LINKS:
                     if download_and_send_pdf(item, label, pdf_url):
                         save_posted_link(pdf_url)
-                        posted_links.add(pdf_url)
                         total_sent += 1
 
         for item in items[limit:]:
             for _, pdf_url in item["pdfs"]:
-                if pdf_url not in posted_links:
+                if pdf_url not in MEMORY_POSTED_LINKS:
                     save_posted_link(pdf_url)
-                    posted_links.add(pdf_url)
 
-    print(f"[*] Done! Total watermarked PDFs sent: {total_sent}")
+    print(f"[*] Scrape cycle complete! Total new PDFs sent: {total_sent}")
+    if total_sent > 0:
+        push_file_to_github_api(HISTORY_FILE, "Sync posted_links.txt [skip ci]")
+        push_file_to_github_api(PDF_MAP_FILE, "Sync posted_data.json [skip ci]")
+
+
+# ================= 11. RENDER 24/7 KEEP-ALIVE ENDPOINT =================
+@app.route("/")
+def keep_alive():
+    return f"Kerala PSC Bot (@{BOT_USERNAME}) is Alive & Listening 24/7! Tracked PDFs: {len(MEMORY_PDF_MAP)}", 200
+
+
+def background_scraper_loop():
+    while True:
+        try:
+            run_scraper_cycle()
+        except Exception as e:
+            print(f"[!] Scraper loop error: {e}")
+        time.sleep(SCRAPE_INTERVAL_SECONDS)
+
+
+def start_bot_polling():
+    print(f"[*] Starting 24/7 Instant Listener for @{BOT_USERNAME}...")
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=10, allowed_updates=["message", "callback_query"])
+        except Exception as e:
+            print(f"[!] Polling restart: {e}")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
-    main()
+    init_storage()
+    if os.environ.get("RENDER") or os.environ.get("PORT"):
+        threading.Thread(target=start_bot_polling, daemon=True).start()
+        threading.Thread(target=background_scraper_loop, daemon=True).start()
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host="0.0.0.0", port=port)
+    else:
+        run_scraper_cycle()
