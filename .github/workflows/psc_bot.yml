@@ -1,0 +1,39 @@
+name: Kerala PSC Automated Bot
+
+on:
+  schedule:
+    # Oro 2 manikkoor koodumbol run aakum
+    - cron: '0 */2 * * *'
+  workflow_dispatch: # Manual aayi test cheyyanulla button
+
+permissions:
+  contents: write # JSON file update cheythu save cheyyanulla permission
+
+jobs:
+  scrape-and-post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run PSC Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: python bot.py
+
+      - name: Save Updated Database to GitHub
+        run: |
+          git config --global user.name "PSC-Auto-Bot"
+          git config --global user.email "bot@noreply.github.com"
+          git add posted_data.json
+          git diff --staged --quiet || (git commit -m "Auto-update posted PSC items" && git push)
