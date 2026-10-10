@@ -1,77 +1,87 @@
-name: Kerala PSC Bot Runner
+name: Kerala PSC Bot
 
 on:
-  workflow_dispatch: # Allows manual run button
+  push:
+    branches: [ main ]
+  workflow_dispatch:
   schedule:
-    - cron: '0 */2 * * *' # Runs every 2 hours
+    - cron: '0 */2 * * *'
+
+permissions:
+  contents: write
 
 jobs:
-  run-bot:
+  scrape-and-post:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pyTelegramBotAPI PyMuPDF urllib3
 
-      # --- DIRECT TELEGRAM PERMISSION CHECK ---
-      - name: Test Telegram Bot & Channel Permissions
+      - name: 1. Send Direct Test Message & Verify Secrets
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TOKEN_1: ${{ secrets.BOT_TOKEN }}
+          TOKEN_2: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TOKEN_3: ${{ secrets.TOKEN }}
         run: |
-          python -c "
+          python - << 'EOF'
           import os, sys, requests
 
-          token = os.environ.get('BOT_TOKEN', '').strip()
-          chat_id = os.environ.get('CHAT_ID', '@topkeralapsc').strip()
-          if not chat_id.startswith('@') and not chat_id.startswith('-'):
-              chat_id = '@' + chat_id
+          # Automatically pick whichever secret name you saved in GitHub Settings
+          token = (os.environ.get("TOKEN_1") or os.environ.get("TOKEN_2") or os.environ.get("TOKEN_3") or "").strip()
+          chat_id = "@topkeralapsc"
 
-          print(f'[*] Testing Telegram connection to channel: {chat_id}')
           if not token:
-              print('::error::BOT_TOKEN secret is empty or missing!')
+              print("❌ ERROR: No Bot Token found in GitHub Secrets!")
+              print("Go to Repo Settings -> Secrets and variables -> Actions -> New repository secret -> Name it BOT_TOKEN")
               sys.exit(1)
 
-          # 1. Check getMe
-          r = requests.get(f'https://api.telegram.org/bot{token}/getMe').json()
-          if not r.get('ok'):
-              print(f'::error::Invalid BOT_TOKEN: {r}')
-              sys.exit(1)
-          print(f'✅ Bot authenticated: @{r[\"result\"][\"username\"]}')
-
-          # 2. Send Live Test Message
-          msg = '🚀 <b>GitHub Actions Test:</b> Bot permissions verified for @topkeralapsc!'
-          send_url = f'https://api.telegram.org/bot{token}/sendMessage'
-          res = requests.post(send_url, data={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}).json()
-
-          if not res.get('ok'):
-              print(f'::error::Failed to post to {chat_id}: {res}')
+          print(f"[*] Found Token (starts with {token[:6]}...). Testing getMe...")
+          me = requests.get(f"https://api.telegram.org/bot{token}/getMe").json()
+          if not me.get("ok"):
+              print(f"❌ INVALID TOKEN: {me}")
               sys.exit(1)
 
-          print(f'🎉 Test message posted successfully to {chat_id}!')
-          "
+          bot_username = me["result"]["username"]
+          print(f"✅ Authenticated as @{bot_username}")
 
-      # --- RUN MAIN SCRAPER & PDF WATERMARKER ---
-      - name: Run Kerala PSC Bot Script
+          # Send test message to @topkeralapsc
+          res = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data={
+                  "chat_id": chat_id,
+                  "text": f"✅ <b>Connected!</b> @{bot_username} is now active on @topkeralapsc. Fetching watermarked Kerala PSC PDFs...",
+                  "parse_mode": "HTML"
+              }
+          ).json()
+
+          if not res.get("ok"):
+              print(f"❌ TELEGRAM REJECTED POST TO {chat_id}: {res}")
+              print(f"👉 Fix: Open @topkeralapsc on Telegram -> Administrators -> Add @{bot_username} as Admin with 'Post Messages' enabled!")
+              sys.exit(1)
+
+          print("🎉 SUCCESS! Test message delivered to @topkeralapsc!")
+          EOF
+
+      - name: 2. Run Main Bot Script (bot.py)
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python bot.py
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN || secrets.TOKEN }}
+          CHAT_ID: "@topkeralapsc"
+        run: |
+          python -u bot.py
 
-      # --- SAVE POSTED LINKS BACK TO GITHUB ---
-      - name: Commit and push tracking file
+      - name: 3. Save Posted Links
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add posted_links.txt || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update posted_links.txt [skip ci]" && git push)
+          git add posted_links.txt posted_data.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update posted links" && git push)
