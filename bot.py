@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from flask import Flask
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import fitz  # PyMuPDF
+import pymupdf as fitz  # Modern PyMuPDF import (Zero deprecation warnings!)
 from urllib.parse import urljoin, quote
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -847,9 +847,16 @@ def background_scraper_loop():
 
 def start_bot_polling():
     print(f"[*] Starting 24/7 Instant Listener for @{BOT_USERNAME}...")
+    # Wait 5 seconds on boot so any previous Render container during a deploy finishes shutting down
+    time.sleep(5)
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=10, allowed_updates=["message", "callback_query"])
+            bot.remove_webhook()
+            bot.infinity_polling(
+                timeout=20,
+                long_polling_timeout=10,
+                allowed_updates=["message", "callback_query"]
+            )
         except Exception as e:
             print(f"[!] Polling restart: {e}")
             time.sleep(5)
