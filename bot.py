@@ -119,12 +119,13 @@ def fetch_url(url, is_pdf=False):
     return None
 
 
-# ================= 3. PREMIUM PDF WATERMARKING (CENTERED PILLS + 45° UPWARD) =================
+# ================= 3. CRASH-PROOF PREMIUM PDF WATERMARKING =================
 def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
     """
-    1. Top-Center Premium Rounded Pill Badge (Clickable)
-    2. Bottom-Center Premium Solid Pill Badge (Clickable)
-    3. Dead-Center 45° Upward Diagonal Watermark (Ultra-light 0.11 opacity so text is 100% readable)
+    Uses 100% built-in 'helv' font and exact text-width centering so it NEVER crashes:
+    1. Top-Center Rounded Pill Badge (Clickable)
+    2. Bottom-Center Solid Pill Badge (Clickable)
+    3. Dead-Center 45° Upward (/) Diagonal Watermark (Soft 0.14 opacity)
     """
     try:
         doc = fitz.open(input_pdf_path)
@@ -135,69 +136,88 @@ def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
             cx, cy = w / 2.0, h / 2.0
 
             # --- 1. TOP-CENTER PREMIUM PILL BADGE ---
-            badge_w = min(390, w - 40)
-            top_box = fitz.Rect(cx - badge_w / 2, 6, cx + badge_w / 2, 24)
-            # Soft sky-blue pill with royal-blue border
+            top_text = "TELEGRAM CHANNEL: @topkeralapsc  |  Click to Join: t.me/topkeralapsc"
+            top_fs = 8.5
+            top_tw = fitz.get_text_length(top_text, fontname="helv", fontsize=top_fs)
+            top_pad_x = 18
+            top_box = fitz.Rect(cx - (top_tw / 2) - top_pad_x, 6, cx + (top_tw / 2) + top_pad_x, 24)
+
             page.draw_rect(
                 top_box,
                 color=(0.0, 0.45, 0.77),
-                fill=(0.93, 0.97, 1.0),
-                width=0.8,
-                radius=0.25,
+                fill=(0.92, 0.96, 1.0),
+                width=1.0,
+                radius=0.3,
                 overlay=True
             )
-            page.insert_textbox(
-                fitz.Rect(top_box.x0, top_box.y0 + 3.5, top_box.x1, top_box.y1),
-                "TELEGRAM CHANNEL: @topkeralapsc   •   CLICK TO JOIN",
-                fontsize=8,
-                fontname="helbo",  # Bold Helvetica
+            page.insert_text(
+                fitz.Point(cx - (top_tw / 2), 18),
+                top_text,
+                fontsize=top_fs,
+                fontname="helv",
                 color=(0.0, 0.28, 0.55),
-                align=fitz.TEXT_ALIGN_CENTER,
                 overlay=True
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": top_box, "uri": CHANNEL_URL})
 
             # --- 2. BOTTOM-CENTER PREMIUM PILL BADGE ---
-            bot_w = min(430, w - 40)
-            bottom_box = fitz.Rect(cx - bot_w / 2, h - 25, cx + bot_w / 2, h - 6)
-            # Deep Navy-Telegram-Blue pill with gold/white text
+            bot_text = "JOIN TELEGRAM FOR KERALA PSC UPDATES:  t.me/topkeralapsc  (CLICK HERE)"
+            bot_fs = 8.5
+            bot_tw = fitz.get_text_length(bot_text, fontname="helv", fontsize=bot_fs)
+            bot_pad_x = 18
+            bottom_box = fitz.Rect(cx - (bot_tw / 2) - bot_pad_x, h - 25, cx + (bot_tw / 2) + bot_pad_x, h - 7)
+
             page.draw_rect(
                 bottom_box,
                 color=(0.0, 0.35, 0.65),
                 fill=(0.0, 0.44, 0.76),
-                width=0.8,
-                radius=0.25,
+                width=1.0,
+                radius=0.3,
                 overlay=True
             )
-            page.insert_textbox(
-                fitz.Rect(bottom_box.x0, bottom_box.y0 + 4, bottom_box.x1, bottom_box.y1),
-                "JOIN TELEGRAM FOR KERALA PSC UPDATES:  t.me/topkeralapsc  (CLICK HERE)",
-                fontsize=8,
-                fontname="helbo",
+            page.insert_text(
+                fitz.Point(cx - (bot_tw / 2), h - 13),
+                bot_text,
+                fontsize=bot_fs,
+                fontname="helv",
                 color=(1.0, 1.0, 1.0),
-                align=fitz.TEXT_ALIGN_CENTER,
                 overlay=True
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": bottom_box, "uri": CHANNEL_URL})
 
-            # --- 3. DEAD-CENTER 45° UPWARD WATERMARK (NON-INTRUSIVE) ---
-            # Positive 45 degrees in PyMuPDF rotates counter-clockwise (45° UPWARD from bottom-left to top-right)
-            wm_box = fitz.Rect(cx - 230, cy - 45, cx + 230, cy + 45)
+            # --- 3. CENTER 45° UPWARD (/) DIAGONAL WATERMARK ---
+            wm_line1 = "TELEGRAM: @topkeralapsc"
+            wm_line2 = "https://t.me/topkeralapsc"
+            wm_fs = 26
+
             pivot = fitz.Point(cx, cy)
-            page.insert_textbox(
-                wm_box,
-                "TELEGRAM: @topkeralapsc\nt.me/topkeralapsc",
-                fontsize=26,
-                fontname="helbo",
-                color=(0.15, 0.40, 0.65),
-                fill_opacity=0.11,  # Very soft opacity so exam questions/numbers are never obscured
-                align=fitz.TEXT_ALIGN_CENTER,
-                morph=(pivot, fitz.Matrix(45)),  # +45° upward standard watermark angle
+            w1 = fitz.get_text_length(wm_line1, fontname="helv", fontsize=wm_fs)
+            w2 = fitz.get_text_length(wm_line2, fontname="helv", fontsize=wm_fs)
+
+            page.insert_text(
+                fitz.Point(cx - (w1 / 2), cy - 8),
+                wm_line1,
+                fontsize=wm_fs,
+                fontname="helv",
+                color=(0.10, 0.42, 0.72),
+                fill_opacity=0.14,
+                morph=(pivot, fitz.Matrix(45)),
+                overlay=True
+            )
+            page.insert_text(
+                fitz.Point(cx - (w2 / 2), cy + 24),
+                wm_line2,
+                fontsize=wm_fs,
+                fontname="helv",
+                color=(0.10, 0.42, 0.72),
+                fill_opacity=0.14,
+                morph=(pivot, fitz.Matrix(45)),
                 overlay=True
             )
 
         doc.save(output_pdf_path)
         doc.close()
+        print("[+] Watermark applied successfully!")
         return True
     except Exception as e:
         print(f"❌ Watermark error: {e}")
@@ -536,7 +556,7 @@ def download_and_send_pdf(item, label, pdf_url):
         formatted_body, extracted_post_name = format_structured_details(item, doc_type_display)
         custom_filename = build_clean_filename(extracted_post_name, item["short_tag"], label)
 
-        # Extra blank line (\n\n) added after formatted_body so the footer stays visually separate
+        # Extra blank line (\n\n) before the footer separator
         caption = (
             f"{item['emoji']} <b>KERALA PSC {item['category']}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
