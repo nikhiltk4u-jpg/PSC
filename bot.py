@@ -1,161 +1,135 @@
-import os
-import json
-import time
-import urllib3
-import requests
-from bs4 import BeautifulSoup
-import telebot
-
-# Govt site SSL warning ozhivakkan
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-CHANNEL_ID = os.environ.get('CHANNEL_ID') # Eg: @keralapsc_updates
-bot = telebot.TeleBot(BOT_TOKEN)
-
-DB_FILE = 'posted_data.json'
-BASE_URL = "https://www.keralapsc.gov.in"
-
-# Website block cheyyathirikkan normal browser pole act cheyyunnu
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
-
-def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    return []
-
-def save_db(data):
-    # File valuthavathirikkan avasanathe 500 items mathram save cheyyunnu
-    with open(DB_FILE, 'w') as f:
-        json.dump(data[-500:], f, indent=2)
-
-def get_pdf_link(row):
-    a_tag = row.find('a', href=True)
-    if a_tag and '.pdf' in a_tag['href'].lower():
-        href = a_tag['href']
-        return href if href.startswith('http') else BASE_URL + href
-    return None
-
-def send_item_to_telegram(caption, pdf_url, file_prefix):
+# ================= UPGRADED PDF WATERMARKING =================
+def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
+    """Adds a prominent clickable Telegram banner (top & bottom) and clear diagonal watermark."""
     try:
-        if pdf_url:
-            pdf_res = requests.get(pdf_url, headers=HEADERS, verify=False, timeout=20)
-            if pdf_res.status_code == 200:
-                file_name = f"{file_prefix}.pdf"
-                bot.send_document(
-                    CHANNEL_ID, 
-                    (file_name, pdf_res.content), 
-                    caption=caption, 
-                    parse_mode='HTML'
-                )
-                time.sleep(3) # Telegram flood limit ozhivakkan
-                return True
-        
-        # PDF illengil allengil download fail aayal text mathram ayakkum
-        bot.send_message(CHANNEL_ID, caption, parse_mode='HTML', disable_web_page_preview=True)
-        time.sleep(2)
+        doc = fitz.open(input_pdf_path)
+        for page in doc:
+            rect = page.rect
+            
+            # --- 1. TOP TELEGRAM BANNER (Clickable Blue Box) ---
+            top_box = fitz.Rect(20, 5, rect.width - 20, 23)
+            # Draw a light Telegram-blue background strip at the top
+            page.draw_rect(top_box, color=(0.0, 0.53, 0.8), fill=(0.90, 0.96, 1.0))
+            
+            top_text = "TELEGRAM CHANNEL: @topkeralapsc  |  Click to Join: https://t.me/topkeralapsc"
+            page.insert_text(
+                fitz.Point(30, 17),
+                top_text,
+                fontsize=8.5,
+                fontname="helv",
+                color=(0.0, 0.35, 0.65)
+            )
+            page.insert_link({
+                "kind": fitz.LINK_URI,
+                "from": top_box,
+                "uri": CHANNEL_URL
+            })
+
+            # --- 2. BOTTOM TELEGRAM BANNER (Clickable Solid Blue Bar) ---
+            bottom_box = fitz.Rect(20, rect.height - 25, rect.width - 20, rect.height - 6)
+            page.draw_rect(bottom_box, color=(0.0, 0.53, 0.8), fill=(0.0, 0.53, 0.8))
+            
+            footer_text = "JOIN TELEGRAM FOR KERALA PSC UPDATES: https://t.me/topkeralapsc (CLICK HERE)"
+            page.insert_text(
+                fitz.Point(30, rect.height - 12),
+                footer_text,
+                fontsize=8.5,
+                fontname="helv",
+                color=(1.0, 1.0, 1.0)  # White text on Telegram blue bar
+            )
+            page.insert_link({
+                "kind": fitz.LINK_URI,
+                "from": bottom_box,
+                "uri": CHANNEL_URL
+            })
+
+            # --- 3. CENTER DIAGONAL WATERMARK (Explicitly says Telegram) ---
+            center_point = fitz.Point(rect.width / 5, rect.height / 1.7)
+            watermark_text = "Telegram: @topkeralapsc\nt.me/topkeralapsc"
+            page.insert_text(
+                center_point,
+                watermark_text,
+                fontsize=28,
+                fontname="helv",
+                color=(0.82, 0.82, 0.82),  # Subtle light grey
+                rotate=45,
+                overlay=False
+            )
+
+        doc.save(output_pdf_path)
+        doc.close()
         return True
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        print(f"[!] Watermark error: {e}")
         return False
 
-def scrape_notifications(posted_ids):
-    url = f"{BASE_URL}/notifications"
-    try:
-        res = requests.get(url, headers=HEADERS, verify=False, timeout=15)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        for row in soup.find_all('tr')[1:6]: # Latest 5 notifications nokkunnu
-            cols = row.find_all('td')
-            if len(cols) >= 3:
-                post_name = cols[0].text.strip()
-                cat_no = cols[1].text.strip()
-                last_date = cols[2].text.strip()
-                pdf_url = get_pdf_link(row)
-                
-                unique_id = f"NOTIF_{cat_no}"
-                if cat_no and unique_id not in posted_ids:
-                    caption = (
-                        f"🔔 <b>PUTHIYA PSC NOTIFICATION</b> 🔔\n\n"
-                        f"📌 <b>Post:</b> {post_name}\n"
-                        f"🏷 <b>Category No:</b> <code>{cat_no}</code>\n"
-                        f"⏳ <b>Last Date:</b> {last_date}\n"
-                        f"💰 <b>Fee:</b> Nil (One Time Registration vazhi)\n\n"
-                        f"📋 <i>Qualification, Age limit, Syllabus enniva ariyan attached PDF nokkuka.</i>\n\n"
-                        f"🔗 <a href='https://thulasi.psc.kerala.gov.in/thulasi/'>Apply Online (Thulasi Profile)</a>"
-                    )
-                    if send_item_to_telegram(caption, pdf_url, f"Notification_Cat_{cat_no.replace('/', '_')}"):
-                        posted_ids.append(unique_id)
-    except Exception as e:
-        print(f"Notification Scrape Error: {e}")
 
-def scrape_ranklists(posted_ids):
-    url = f"{BASE_URL}/ranked-list"
-    try:
-        res = requests.get(url, headers=HEADERS, verify=False, timeout=15)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        for row in soup.find_all('tr')[1:6]:
-            cols = row.find_all('td')
-            if len(cols) >= 3:
-                post_name = cols[0].text.strip()
-                cat_no = cols[1].text.strip()
-                dept = cols[2].text.strip()
-                pdf_url = get_pdf_link(row)
-                
-                unique_id = f"RANK_{cat_no}_{post_name[:10]}"
-                if cat_no and unique_id not in posted_ids:
-                    caption = (
-                        f"🏆 <b>PSC RANK LIST PUBLISHED</b> 🏆\n\n"
-                        f"📌 <b>Post:</b> {post_name}\n"
-                        f"🏢 <b>Dept:</b> {dept}\n"
-                        f"🏷 <b>Category No:</b> <code>{cat_no}</code>\n\n"
-                        f"📊 <i>Rank List-um Minimum Cut-off Mark-um thazhe ulla PDF-il undu.</i>"
-                    )
-                    if send_item_to_telegram(caption, pdf_url, f"RankList_{cat_no.replace('/', '_')}"):
-                        posted_ids.append(unique_id)
-    except Exception as e:
-        print(f"Ranklist Scrape Error: {e}")
+# ================= UPGRADED FILENAME & SENDER =================
+def download_and_send_pdf(item, label, pdf_url):
+    """Downloads PDF, watermarks it, and sends it with a clear Telegram filename."""
+    raw_file = "temp_raw.pdf"
+    watermarked_file = "temp_watermarked.pdf"
 
-def scrape_question_papers(posted_ids):
-    url = f"{BASE_URL}/examination/question-paper"
     try:
-        res = requests.get(url, headers=HEADERS, verify=False, timeout=15)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        for row in soup.find_all('tr')[1:6]:
-            cols = row.find_all('td')
-            if len(cols) >= 2:
-                exam_name = cols[0].text.strip()
-                q_code = cols[1].text.strip()
-                pdf_url = get_pdf_link(row)
-                
-                unique_id = f"QP_{q_code}_{exam_name[:10]}"
-                if q_code and unique_id not in posted_ids:
-                    caption = (
-                        f"📄 <b>PSC QUESTION PAPER</b> 📄\n\n"
-                        f"📝 <b>Exam:</b> {exam_name}\n"
-                        f"🔢 <b>QP Code:</b> <code>{q_code}</code>\n\n"
-                        f"✅ <i>Adutha exam-nu padikkunnavarkku ee question paper download cheythu practice cheyyam!</i>"
-                    )
-                    if send_item_to_telegram(caption, pdf_url, f"QP_{q_code.replace('/', '_')}"):
-                        posted_ids.append(unique_id)
-    except Exception as e:
-        print(f"QP Scrape Error: {e}")
+        print(f"[*] Downloading PDF: {pdf_url}")
+        r = requests.get(pdf_url, headers=HEADERS, verify=False, timeout=30)
+        if r.status_code != 200:
+            print(f"[!] Failed to download PDF: {r.status_code}")
+            return False
 
-if __name__ == "__main__":
-    posted_ids = load_db()
-    initial_count = len(posted_ids)
-    
-    scrape_notifications(posted_ids)
-    scrape_ranklists(posted_ids)
-    scrape_question_papers(posted_ids)
-    
-    if len(posted_ids) > initial_count:
-        save_db(posted_ids)
-        print(f"Added {len(posted_ids) - initial_count} new items.")
-    else:
-        print("No new updates found.")
+        with open(raw_file, "wb") as f:
+            f.write(r.content)
+
+        # Apply watermark
+        watermarked_ok = add_watermark_to_pdf(raw_file, watermarked_file)
+        file_to_send = watermarked_file if watermarked_ok else raw_file
+
+        # Identify the document type for a clear filename
+        cat_upper = item["category"].upper()
+        if "QUESTION" in label.upper():
+            doc_prefix = "PSC_Question_Paper"
+        elif "ANSWER" in label.upper() or "ANSWER" in cat_upper:
+            doc_prefix = "PSC_Answer_Key"
+        elif "RANK" in cat_upper:
+            doc_prefix = "PSC_Rank_List"
+        elif "SHORT" in cat_upper:
+            doc_prefix = "PSC_Short_List"
+        else:
+            doc_prefix = "Kerala_PSC_Notification"
+
+        # Explicitly include 'Telegram_@topkeralapsc' and 't.me-topkeralapsc' in filename
+        custom_filename = f"{doc_prefix}__Telegram_@topkeralapsc_(t.me-topkeralapsc).pdf"
+
+        # Format Telegram Caption
+        caption = (
+            f"{item['emoji']} <b>KERALA PSC {item['category']}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Details:</b> {item['details']}\n\n"
+            f"📄 <b>Document:</b> {label}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📲 <b>Telegram Search:</b> <code>@topkeralapsc</code>\n"
+            f"🔗 <b>Join Channel:</b> https://t.me/topkeralapsc\n\n"
+            f"{item['hashtag']}"
+        )
+
+        with open(file_to_send, "rb") as doc_file:
+            bot.send_document(
+                chat_id=CHAT_ID,
+                document=doc_file,
+                visible_file_name=custom_filename,
+                caption=caption,
+                parse_mode="HTML"
+            )
+
+        print(f"[+] Successfully posted: {custom_filename}")
+        time.sleep(3)
+        return True
+
+    except Exception as e:
+        print(f"[!] Error sending to Telegram: {e}")
+        return False
+
+    finally:
+        for f in [raw_file, watermarked_file]:
+            if os.path.exists(f):
+                os.remove(f)
