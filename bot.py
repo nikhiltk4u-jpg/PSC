@@ -74,30 +74,27 @@ SOURCES = [
     }
 ]
 
+KERALA_DISTRICTS = [
+    "Thiruvananthapuram", "Kollam", "Pathanamthitta", "Alappuzha", "Kottayam",
+    "Idukki", "Ernakulam", "Thrissur", "Palakkad", "Malappuram", "Kozhikode",
+    "Wayanad", "Kannur", "Kasaragod", "Kasargod", "Statewide"
+]
+
 
 # ================= 1. TIME & DATE HELPERS (IST) =================
 def get_ist_today():
-    """Returns today's date in Indian Standard Time (UTC+5:30)."""
     ist_tz = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist_tz).date()
 
 
 def get_days_until_deadline(date_str):
-    """
-    Parses a Kerala PSC date string (e.g. '04-11-2026') and returns the number of days left:
-      > 1 : Still open (multiple days left)
-      1   : Tomorrow is the Last Date!
-      0   : Today is the Last Date!
-      < 0 : Expired
-    """
     date_match = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})", date_str)
     if not date_match:
         return 999
     try:
         day, month, year = map(int, date_match.groups())
         deadline_date = datetime(year, month, day).date()
-        today_ist = get_ist_today()
-        return (deadline_date - today_ist).days
+        return (deadline_date - get_ist_today()).days
     except Exception:
         return 999
 
@@ -122,51 +119,80 @@ def fetch_url(url, is_pdf=False):
     return None
 
 
-# ================= 3. GUARANTEED PDF WATERMARKING =================
+# ================= 3. PREMIUM PDF WATERMARKING (CENTERED PILLS + 45° UPWARD) =================
 def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
+    """
+    1. Top-Center Premium Rounded Pill Badge (Clickable)
+    2. Bottom-Center Premium Solid Pill Badge (Clickable)
+    3. Dead-Center 45° Upward Diagonal Watermark (Ultra-light 0.11 opacity so text is 100% readable)
+    """
     try:
         doc = fitz.open(input_pdf_path)
         for page in doc:
             page.clean_contents()
             rect = page.rect
             w, h = rect.width, rect.height
+            cx, cy = w / 2.0, h / 2.0
 
-            # 1. Top Telegram Banner
-            top_box = fitz.Rect(15, 4, w - 15, 22)
-            page.draw_rect(top_box, color=(0.0, 0.47, 0.78), fill=(0.91, 0.96, 1.0), overlay=True)
-            page.insert_text(
-                fitz.Point(25, 16),
-                "TELEGRAM: @topkeralapsc  |  Click to Join: https://t.me/topkeralapsc",
-                fontsize=8.5,
-                fontname="helv",
-                color=(0.0, 0.32, 0.60),
+            # --- 1. TOP-CENTER PREMIUM PILL BADGE ---
+            badge_w = min(390, w - 40)
+            top_box = fitz.Rect(cx - badge_w / 2, 6, cx + badge_w / 2, 24)
+            # Soft sky-blue pill with royal-blue border
+            page.draw_rect(
+                top_box,
+                color=(0.0, 0.45, 0.77),
+                fill=(0.93, 0.97, 1.0),
+                width=0.8,
+                radius=0.25,
+                overlay=True
+            )
+            page.insert_textbox(
+                fitz.Rect(top_box.x0, top_box.y0 + 3.5, top_box.x1, top_box.y1),
+                "TELEGRAM CHANNEL: @topkeralapsc   •   CLICK TO JOIN",
+                fontsize=8,
+                fontname="helbo",  # Bold Helvetica
+                color=(0.0, 0.28, 0.55),
+                align=fitz.TEXT_ALIGN_CENTER,
                 overlay=True
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": top_box, "uri": CHANNEL_URL})
 
-            # 2. Bottom Telegram Banner
-            bottom_box = fitz.Rect(15, h - 24, w - 15, h - 5)
-            page.draw_rect(bottom_box, color=(0.0, 0.47, 0.78), fill=(0.0, 0.47, 0.78), overlay=True)
-            page.insert_text(
-                fitz.Point(25, h - 11),
-                "JOIN TELEGRAM CHANNEL: @topkeralapsc (https://t.me/topkeralapsc) - CLICK HERE",
-                fontsize=8.5,
-                fontname="helv",
+            # --- 2. BOTTOM-CENTER PREMIUM PILL BADGE ---
+            bot_w = min(430, w - 40)
+            bottom_box = fitz.Rect(cx - bot_w / 2, h - 25, cx + bot_w / 2, h - 6)
+            # Deep Navy-Telegram-Blue pill with gold/white text
+            page.draw_rect(
+                bottom_box,
+                color=(0.0, 0.35, 0.65),
+                fill=(0.0, 0.44, 0.76),
+                width=0.8,
+                radius=0.25,
+                overlay=True
+            )
+            page.insert_textbox(
+                fitz.Rect(bottom_box.x0, bottom_box.y0 + 4, bottom_box.x1, bottom_box.y1),
+                "JOIN TELEGRAM FOR KERALA PSC UPDATES:  t.me/topkeralapsc  (CLICK HERE)",
+                fontsize=8,
+                fontname="helbo",
                 color=(1.0, 1.0, 1.0),
+                align=fitz.TEXT_ALIGN_CENTER,
                 overlay=True
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": bottom_box, "uri": CHANNEL_URL})
 
-            # 3. 45-Degree Diagonal Watermark
-            pivot = fitz.Point(w * 0.22, h * 0.62)
-            page.insert_text(
-                pivot,
-                "Telegram: @topkeralapsc\nhttps://t.me/topkeralapsc",
-                fontsize=28,
-                fontname="helv",
-                color=(0.10, 0.45, 0.75),
-                fill_opacity=0.22,
-                morph=(pivot, fitz.Matrix(-45)),
+            # --- 3. DEAD-CENTER 45° UPWARD WATERMARK (NON-INTRUSIVE) ---
+            # Positive 45 degrees in PyMuPDF rotates counter-clockwise (45° UPWARD from bottom-left to top-right)
+            wm_box = fitz.Rect(cx - 230, cy - 45, cx + 230, cy + 45)
+            pivot = fitz.Point(cx, cy)
+            page.insert_textbox(
+                wm_box,
+                "TELEGRAM: @topkeralapsc\nt.me/topkeralapsc",
+                fontsize=26,
+                fontname="helbo",
+                color=(0.15, 0.40, 0.65),
+                fill_opacity=0.11,  # Very soft opacity so exam questions/numbers are never obscured
+                align=fitz.TEXT_ALIGN_CENTER,
+                morph=(pivot, fitz.Matrix(45)),  # +45° upward standard watermark angle
                 overlay=True
             )
 
@@ -178,52 +204,146 @@ def add_watermark_to_pdf(input_pdf_path, output_pdf_path):
         return False
 
 
-# ================= 4. SMART EXAM NAME EXTRACTOR FOR FILENAME =================
-def build_clean_filename(item, label):
-    details = item["details"]
-
-    cat_match = re.search(r"(?:Cat\.?\s*No\.?|Category\s*(?:No|Code)\s*:?)\s*(\d+\s*/\s*\d{4})", details, re.IGNORECASE)
-    cat_str = ""
-    if cat_match:
-        cat_str = "_Cat_" + re.sub(r"\s+", "", cat_match.group(1)).replace("/", "_")
-
-    parts = [p.strip() for p in details.split("|") if p.strip()]
-    exam_name = parts[0] if parts else "Kerala_PSC"
-
-    if len(parts) > 1 and (exam_name[:4].isdigit() or len(exam_name) < 12):
-        exam_name = f"{parts[1]}_{parts[0]}"
-
-    exam_name = exam_name.split("-")[0].split("(")[0].strip()
-    clean_exam = re.sub(r"[^A-Za-z0-9]+", "_", exam_name).strip("_")
-    clean_exam = "_".join(w.capitalize() for w in clean_exam.split("_") if w)[:20].rstrip("_")
-
-    if not clean_exam:
-        clean_exam = "PSC"
-
-    label_up = label.upper()
-    if item["short_tag"] == "JobNotification":
-        doc_tag = "Notification"
-    elif "QUESTION" in label_up:
-        doc_tag = "QP"
-    elif "ANSWER" in label_up or item["short_tag"] == "OMR":
-        doc_tag = "AnswerKey"
-    else:
-        doc_tag = item["short_tag"]
-
-    return f"{clean_exam}{cat_str}_{doc_tag}_Telegram_@topkeralapsc.pdf"
-
-
-# ================= 5. LIVE JOB NOTIFICATIONS + LAST DATE REMINDER ALERTS =================
+# ================= 4. CLEAN STRUCTURED DETAILS PARSER =================
 def clean_text(text):
     return " ".join(text.split())
 
 
+def format_structured_details(item, doc_type_display):
+    raw = item["details"]
+    tag = item["short_tag"]
+    lines = []
+
+    # --- CASE 1: LIVE JOB NOTIFICATION ---
+    if tag == "JobNotification":
+        post_raw = item.get("post_title", raw.split("|")[0]).strip()
+        gaz_date = item.get("gaz_date", "")
+        last_date = item.get("last_date", "")
+
+        cat_m = re.search(r"(?:Cat\.?\s*No\.?)\s*([0-9/,\s]+)", post_raw, re.I)
+        cat_no = cat_m.group(1).strip() if cat_m else ""
+        clean_post = re.sub(r"\(?\s*Cat\.?\s*No\.?\s*[0-9/,\s]+\)?", "", post_raw, flags=re.I).strip(" -|()")
+
+        dept = ""
+        if " - " in clean_post:
+            parts = clean_post.split(" - ", 1)
+            clean_post, dept = parts[0].strip(), parts[1].strip()
+
+        lines.append(f"💼 <b>Post:</b> {clean_post}")
+        if dept:
+            lines.append(f"🏛 <b>Department:</b> {dept}")
+        if cat_no:
+            lines.append(f"🔢 <b>Category No:</b> <code>{cat_no}</code>")
+        if gaz_date:
+            lines.append(f"📰 <b>Gazette Date:</b> {gaz_date}")
+        if last_date:
+            lines.append(f"⏳ <b>Last Date to Apply:</b> <u><b>{last_date}</b></u>")
+        lines.append(f"📄 <b>Document:</b> {doc_type_display}")
+        lines.append("🖥 <b>Apply Online:</b> <a href='https://thulasi.psc.kerala.gov.in/thulasi/'>Kerala PSC Thulasi Portal</a>")
+        return "\n".join(lines), clean_post
+
+    # --- CASE 2: QUESTION PAPER & OMR ANSWER KEY ---
+    if tag == "OMR":
+        qp_code = re.search(r"Question Paper Code\s*:\s*(.*?)(?=Question Paper Medium|Category Code|$)", raw, re.I)
+        medium = re.search(r"Question Paper Medium\s*:\s*(.*?)(?=Category Code|Name Of Post|$)", raw, re.I)
+        cat_code = re.search(r"Category Code\s*:\s*(.*?)(?=Name Of Post|Department|Date Of Test|$)", raw, re.I)
+        post_m = re.search(r"Name Of Post\s*[&:]?\s*(.*?)(?=Department|Date Of Test|\||$)", raw, re.I)
+        dept_m = re.search(r"Department\s*:\s*(.*?)(?=Date Of Test|\||$)", raw, re.I)
+        date_m = re.search(r"Date Of Test\s*:\s*([0-9]{2}[-/][0-9]{2,3}|[0-9]{2}-[A-Za-z]{3}-[0-9]{4}|[0-9/.-]+)", raw, re.I)
+
+        first_chunk = raw.split("|")[0].strip()
+        post_name = post_m.group(1).strip(" :-|") if post_m else first_chunk.split("-")[0].strip()
+        dept_name = dept_m.group(1).strip(" :-|") if dept_m else (first_chunk.split("-")[1].strip() if "-" in first_chunk else "")
+
+        if dept_name.lower() == post_name.lower():
+            dept_name = ""
+
+        lines.append(f"💼 <b>Post:</b> {post_name}")
+        if dept_name:
+            lines.append(f"🏛 <b>Department:</b> {dept_name}")
+        if cat_code and cat_code.group(1).strip():
+            lines.append(f"🔢 <b>Category No:</b> <code>{cat_code.group(1).strip(' |')}</code>")
+        if qp_code and qp_code.group(1).strip():
+            lines.append(f"🧾 <b>QP Code:</b> <code>{qp_code.group(1).strip(' |')}</code>")
+        if medium and medium.group(1).strip():
+            lines.append(f"🌐 <b>Medium:</b> {medium.group(1).strip(' |')}")
+        if date_m and date_m.group(1).strip():
+            lines.append(f"🗓 <b>Exam Date:</b> {date_m.group(1).strip(' |')}")
+        lines.append(f"📄 <b>Document:</b> {doc_type_display}")
+        return "\n".join(lines), post_name
+
+    # --- CASE 3: RANKED LIST & SHORT LIST ---
+    cleaned = re.sub(r"\b20\d{2}\s*,\s*", "", raw)
+    cleaned = re.sub(r"Featured\s*Latest\s*,?", "", cleaned, flags=re.I)
+
+    district = ""
+    for d in KERALA_DISTRICTS:
+        if re.search(rf"\b{d}\b", cleaned, re.I):
+            district = d
+            break
+
+    cat_m = re.search(r"(?:Category\s*No\.?|Cat\.?\s*No\.?)\s*:?\s*([0-9]+\s*/\s*[0-9]{4})", cleaned, re.I)
+    cat_no = re.sub(r"\s+", "", cat_m.group(1)) if cat_m else ""
+
+    list_m = re.search(r"(?:Ranked\s*List|Short\s*List|List)\s*No\.?\s*:?\s*([A-Za-z0-9/\s-]+?)(?=\s+wef|\s+Dated|\||\.|$)", cleaned, re.I)
+    list_no = list_m.group(1).strip() if list_m else ""
+
+    date_m = re.search(r"(?:wef|Dated)?\s*(\d{2}[/-]\d{2}[/-]\d{4})", cleaned, re.I)
+    pub_date = date_m.group(1).strip() if date_m else ""
+
+    chunks = [c.strip() for c in cleaned.split("|") if c.strip()]
+    main_desc = chunks[1] if len(chunks) > 1 else chunks[0]
+    main_desc = re.sub(r"\(?\s*(?:Category|Cat\.?)\s*No\.?\s*:?\s*[0-9/\s]+\)?", "", main_desc, flags=re.I)
+    main_desc = re.sub(r"\s+in\s+[A-Za-z]+\s+District\.?", "", main_desc, flags=re.I).strip(" .-|")
+
+    post_name = main_desc
+    dept_name = ""
+    if " in " in main_desc:
+        parts = main_desc.split(" in ", 1)
+        post_name = parts[0].strip()
+        dept_name = parts[1].strip()
+
+    lines.append(f"💼 <b>Post:</b> {post_name}")
+    if dept_name:
+        lines.append(f"🏛 <b>Department:</b> {dept_name}")
+    if district:
+        lines.append(f"📍 <b>District:</b> {district}")
+    if cat_no:
+        lines.append(f"🔢 <b>Category No:</b> <code>{cat_no}</code>")
+    if list_no:
+        lines.append(f"📋 <b>List No:</b> <code>{list_no}</code>")
+    if pub_date:
+        lines.append(f"🗓 <b>Published Date:</b> {pub_date}")
+    lines.append(f"📄 <b>Document:</b> {doc_type_display}")
+
+    return "\n".join(lines), post_name
+
+
+# ================= 5. COMPACT FILENAME BUILDER =================
+def build_clean_filename(post_name, short_tag, label):
+    clean_exam = re.sub(r"[^A-Za-z0-9]+", "_", post_name).strip("_")
+    words = [w.capitalize() for w in clean_exam.split("_") if w]
+    short_exam = "_".join(words[:2])[:14].rstrip("_")
+    if not short_exam:
+        short_exam = "PSC"
+
+    label_up = label.upper()
+    if short_tag == "JobNotification":
+        doc_tag = "Job"
+    elif "QUESTION" in label_up:
+        doc_tag = "QP"
+    elif "ANSWER" in label_up or short_tag == "OMR":
+        doc_tag = "Key"
+    elif short_tag == "RankList":
+        doc_tag = "RankList"
+    else:
+        doc_tag = "ShortList"
+
+    return f"{short_exam}_{doc_tag}_@topkeralapsc.pdf"
+
+
+# ================= 6. LIVE JOB NOTIFICATIONS + DEADLINE REMINDERS =================
 def scrape_notifications_and_send_reminders(posted_links):
-    """
-    1. Checks /notifications for open Gazettes.
-    2. Sends a 1-Day-Before or Final-Day warning alert if days_left == 1 or 0!
-    3. Returns individual Job Notification PDFs for active Gazettes.
-    """
     active_notifications = []
     print(f"[*] Checking Live Job Notifications & Deadlines at {NOTIFICATIONS_URL}...")
     html = fetch_url(NOTIFICATIONS_URL, is_pdf=False)
@@ -242,15 +362,18 @@ def scrape_notifications_and_send_reminders(posted_links):
         title_text, cat_range, last_date_str = cols[0], cols[1], cols[2]
         days_left = get_days_until_deadline(last_date_str)
 
-        # Skip expired notifications
         if days_left < 0:
             continue
+
+        gaz_date_m = re.search(r"(\d{2}[/-]\d{2}[/-]\d{4})", title_text)
+        gaz_date = gaz_date_m.group(1) if gaz_date_m else title_text
 
         a_tag = row.find("a", href=True)
         if a_tag:
             gazette_url = urljoin(BASE_URL, a_tag["href"].strip())
             active_gazettes.append({
                 "gazette_title": title_text,
+                "gaz_date": gaz_date,
                 "cat_range": cat_range,
                 "last_date": last_date_str,
                 "days_left": days_left,
@@ -275,23 +398,18 @@ def scrape_notifications_and_send_reminders(posted_links):
 
                     post_names_list.append(f"• {post_title[:85]}")
 
-                    details_text = (
-                        f"{post_title} | "
-                        f"Gazette: {gaz['gazette_title']} | "
-                        f"🗓 <b>Last Date to Apply: {gaz['last_date']}</b>"
-                    )
-
                     active_notifications.append({
                         "category": "NEW JOB NOTIFICATION (APPLY NOW)",
                         "short_tag": "JobNotification",
                         "emoji": "📢",
                         "hashtag": "#KeralaPSCNotification #PSCJobs #ApplyNow #KeralaPSC",
-                        "details": details_text,
+                        "details": post_title,
+                        "post_title": post_title,
+                        "gaz_date": gaz["gaz_date"],
                         "last_date": gaz["last_date"],
                         "pdfs": [(post_title, pdf_url)]
                     })
 
-        # --- CHECK IF DEADLINE IS TOMORROW (1 DAY LEFT) OR TODAY (0 DAYS LEFT) ---
         days_left = gaz["days_left"]
         if days_left in (0, 1):
             reminder_key = f"REMINDER_{days_left}DAY_{gaz['url']}"
@@ -304,13 +422,12 @@ def scrape_notifications_and_send_reminders(posted_links):
 
 
 def send_deadline_warning_alert(gaz, post_names_list, days_left):
-    """Sends an urgent 1-Day-Before or Final-Day application closing alert to the channel."""
     if days_left == 1:
         header = "⚠️ <b>KERALA PSC LAST DATE REMINDER: 1 DAY LEFT!</b> ⚠️"
         urgency_line = "⏳ <b>Hurry Up! TOMORROW is the last date to apply for these Kerala PSC posts:</b>"
     else:
         header = "🚨 <b>FINAL CALL: KERALA PSC APPLICATION CLOSES TODAY!</b> 🚨"
-        urgency_line = "⏰ <b> Applications close TONIGHT at 12:00 Midnight! Apply immediately:</b>"
+        urgency_line = "⏰ <b>Applications close TONIGHT at 12:00 Midnight! Apply immediately:</b>"
 
     posts_preview = "\n".join(post_names_list[:12]) if post_names_list else f"• {gaz['cat_range']}"
     if len(post_names_list) > 12:
@@ -320,15 +437,15 @@ def send_deadline_warning_alert(gaz, post_names_list, days_left):
         f"{header}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{urgency_line}\n\n"
-        f"📋 <b>Gazette:</b> {gaz['gazette_title']}\n"
-        f"🔢 <b>Categories:</b> {gaz['cat_range']}\n"
-        f"🗓 <b>Last Date:</b> <u><b>{gaz['last_date']} (12:00 Midnight)</b></u>\n\n"
+        f"📰 <b>Gazette Date:</b> {gaz['gaz_date']}\n"
+        f"🔢 <b>Categories:</b> <code>{gaz['cat_range']}</code>\n"
+        f"⏳ <b>Last Date:</b> <u><b>{gaz['last_date']} (12:00 Midnight)</b></u>\n\n"
         f"📌 <b>Included Posts:</b>\n{posts_preview}\n\n"
         f"🖥 <b>Apply Now (Thulasi Login):</b>\n"
-        f"👉 https://thulasi.psc.kerala.gov.in/thulasi/\n"
+        f"👉 https://thulasi.psc.kerala.gov.in/thulasi/\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📲 <b>Share with friends! Join:</b> @topkeralapsc\n"
-        f"🔗 https://t.me/topkeralapsc\n\n"
+        f"📲 <b>Telegram:</b> <code>@topkeralapsc</code>\n"
+        f"🔗 <b>Join Channel:</b> https://t.me/topkeralapsc\n\n"
         f"#KeralaPSC #LastDateAlert #PSCJobs #Thulasi"
     )
 
@@ -339,13 +456,12 @@ def send_deadline_warning_alert(gaz, post_names_list, days_left):
             parse_mode="HTML",
             disable_web_page_preview=True
         )
-        print(f"[+] Sent {days_left}-Day Last Date Reminder for {gaz['gazette_title']}!")
         time.sleep(2)
     except Exception as e:
         print(f"[!] Failed to send deadline reminder: {e}")
 
 
-# ================= 6. STANDARD TABLE SCRAPER =================
+# ================= 7. STANDARD TABLE SCRAPER =================
 def scrape_table_items(source):
     items = []
     html = fetch_url(source["url"], is_pdf=False)
@@ -367,11 +483,14 @@ def scrape_table_items(source):
         if not pdf_links:
             continue
 
-        cols = [clean_text(td.get_text()) for td in row.find_all(["td", "div"]) if clean_text(td.get_text())]
-        details = " | ".join(cols[:4]) if cols else clean_text(row.get_text())
+        tds = row.find_all("td")
+        if tds:
+            cols = [clean_text(td.get_text()) for td in tds if clean_text(td.get_text())]
+        else:
+            cols = [clean_text(row.get_text())]
+
+        details = " | ".join(cols[:4])
         details = details.replace("Download", "").strip(" |")
-        if len(details) > 400:
-            details = details[:400] + "..."
 
         items.append({
             "category": source["name"],
@@ -385,7 +504,7 @@ def scrape_table_items(source):
     return items
 
 
-# ================= 7. DOWNLOAD, WATERMARK & SEND =================
+# ================= 8. DOWNLOAD, WATERMARK & SEND =================
 def download_and_send_pdf(item, label, pdf_url):
     raw_file = "temp_raw.pdf"
     watermarked_file = "temp_watermarked.pdf"
@@ -403,23 +522,25 @@ def download_and_send_pdf(item, label, pdf_url):
         watermarked_ok = add_watermark_to_pdf(raw_file, watermarked_file)
         file_to_send = watermarked_file if watermarked_ok else raw_file
 
-        custom_filename = build_clean_filename(item, label)
-
         if item["short_tag"] == "JobNotification":
             doc_type_display = "Official Gazette Notification PDF"
-            apply_line = "🖥 <b>Apply Online:</b> <a href='https://thulasi.psc.kerala.gov.in/thulasi/'>Kerala PSC Thulasi Portal</a>\n"
+        elif "question" in label.lower():
+            doc_type_display = "Question Paper PDF"
+        elif "answer" in label.lower() or item["short_tag"] == "OMR":
+            doc_type_display = "OMR Answer Key PDF"
+        elif item["short_tag"] == "RankList":
+            doc_type_display = "Ranked List PDF"
         else:
-            doc_type_display = "Question Paper" if "question" in label.lower() else (
-                "Answer Key" if item["short_tag"] == "OMR" else item["short_tag"]
-            )
-            apply_line = ""
+            doc_type_display = "Short List PDF"
 
+        formatted_body, extracted_post_name = format_structured_details(item, doc_type_display)
+        custom_filename = build_clean_filename(extracted_post_name, item["short_tag"], label)
+
+        # Extra blank line (\n\n) added after formatted_body so the footer stays visually separate
         caption = (
             f"{item['emoji']} <b>KERALA PSC {item['category']}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 <b>Details:</b> {item['details']}\n\n"
-            f"📄 <b>Document:</b> {doc_type_display}\n"
-            f"{apply_line}"
+            f"{formatted_body}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📲 <b>Telegram:</b> <code>@topkeralapsc</code>\n"
             f"🔗 <b>Join Channel:</b> https://t.me/topkeralapsc\n\n"
@@ -466,7 +587,7 @@ def main():
     is_first_run = len(posted_links) == 0
     total_sent = 0
 
-    # --- PART A: LIVE JOB NOTIFICATIONS + AUTOMATIC 1-DAY & FINAL-DAY REMINDERS ---
+    # --- PART A: LIVE JOB NOTIFICATIONS + DEADLINE REMINDERS ---
     live_notifications = scrape_notifications_and_send_reminders(posted_links)
     print(f"    -> Total individual live Job Notification PDFs found: {len(live_notifications)}")
 
