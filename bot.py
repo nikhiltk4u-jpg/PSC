@@ -4,6 +4,7 @@ import re
 import sys
 import time
 import json
+import fcntl
 import base64
 import hashlib
 import threading
@@ -11,10 +12,10 @@ from datetime import datetime, timedelta, timezone
 import urllib3
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
+from flask import Flask, jsonify
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import pymupdf as fitz  # Modern PyMuPDF import (Zero deprecation warnings!)
+import pymupdf as fitz
 from urllib.parse import urljoin, quote
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -37,7 +38,6 @@ elif not raw_chat_id.startswith("@") and not raw_chat_id.startswith("-"):
 else:
     CHAT_ID = raw_chat_id
 
-# GitHub API Auto-Backup Settings (Set in Render Environment Variables)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "nikhiltk4u-jpg/PSC").strip()
 
@@ -47,8 +47,8 @@ HISTORY_FILE = "posted_links.txt"
 PDF_MAP_FILE = "posted_data.json"
 
 SEED_LIMIT_PER_CATEGORY = 2
-MAX_NOTIFICATIONS_PER_RUN = 4
-SCRAPE_INTERVAL_SECONDS = 1800  # Checks Kerala PSC every 30 minutes
+MAX_NOTIFICATIONS_PER_RUN = 3
+SCRAPE_INTERVAL_SECONDS = 1800  # 30 minutes
 
 if not BOT_TOKEN:
     print("❌ FATAL ERROR: BOT_TOKEN is empty!")
@@ -96,9 +96,22 @@ KERALA_DISTRICTS = [
     "Wayanad", "Kannur", "Kasaragod", "Kasargod", "Statewide"
 ]
 
-# In-memory storage for 0.001s instant lookups and zero disk wear
 MEMORY_PDF_MAP = {}
 MEMORY_POSTED_LINKS = set()
+LOCK_FILE_HANDLE = None
+
+BOT_STATUS = {
+    "started_at": "",
+    "last_scrape_time": "Waiting for initial scrape...",
+    "total_posted_this_session": 0,
+    "last_log": "Initializing...",
+    "threads_started": False
+}
+
+
+def log_status(msg):
+    print(msg, flush=True)
+    BOT_STATUS["last_log"] = msg
 
 
 # ================= 1. ZERO-STORAGE MEMORY + GITHUB CLOUD SYNC =================
@@ -119,10 +132,10 @@ def init_storage():
                 MEMORY_POSTED_LINKS.update(line.strip() for line in f if line.strip())
         except Exception:
             pass
+    log_status(f"[*] Loaded {len(MEMORY_POSTED_LINKS)} previously posted links from history.")
 
 
 def push_file_to_github_api(filepath, commit_msg):
-    """Automatically backs up posted_links.txt & posted_data.json to your GitHub repo."""
     if not GITHUB_TOKEN or not os.path.exists(filepath):
         return
     try:
@@ -142,9 +155,9 @@ def push_file_to_github_api(filepath, commit_msg):
             payload["sha"] = sha
 
         requests.put(api_url, headers=headers, json=payload, timeout=15)
-        print(f"[+] Synced {filepath} to GitHub repo {GITHUB_REPO}!")
+        log_status(f"[+] Synced {filepath} to GitHub repo {GITHUB_REPO}!")
     except Exception as e:
-        print(f"[!] GitHub API sync notice: {e}")
+        log_status(f"[!] GitHub API sync notice: {e}")
 
 
 def save_pdf_entry(file_id, pdf_url, filename, title):
@@ -183,12 +196,11 @@ def is_user_subscribed(user_id):
         member = bot.get_chat_member(CHAT_ID, user_id)
         return member.status in ["creator", "administrator", "member"]
     except Exception as e:
-        print(f"[!] Membership check error for {user_id}: {e}")
+        log_status(f"[!] Membership check error for {user_id}: {e}")
         return False
 
 
 def send_clean_pdf_to_user_zero_storage(user_id, file_id):
-    """Streams the un-watermarked PDF directly in RAM (io.BytesIO) -> 0 bytes written to disk!"""
     entry = MEMORY_PDF_MAP.get(file_id)
     if not entry:
         bot.send_message(
@@ -225,7 +237,7 @@ def send_clean_pdf_to_user_zero_storage(user_id, file_id):
             except Exception:
                 pass
         except Exception as e:
-            print(f"[!] Stream send error: {e}")
+            log_status(f"[!] Stream send error: {e}")
     else:
         dl_markup = InlineKeyboardMarkup()
         dl_markup.add(InlineKeyboardButton("📥 Click to Open Clean PDF", url=entry["url"]))
@@ -293,9 +305,13 @@ def handle_dm_recheck_button(call):
 
 
 # ================= 3. TIME & DATE HELPERS (IST) =================
-def get_ist_today():
+def get_ist_now():
     ist_tz = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist_tz).date()
+    return datetime.now(ist_tz)
+
+
+def get_ist_today():
+    return get_ist_now().date()
 
 
 def get_days_until_deadline(date_str):
@@ -310,29 +326,37 @@ def get_days_until_deadline(date_str):
         return 999
 
 
-# ================= 4. FETCH WITH PROXY FALLBACK =================
+# ================= 4. MULTI-PROXY FETCH =================
 def fetch_url(url, is_pdf=False):
     try:
-        r = requests.get(url, headers=HEADERS, verify=False, timeout=20)
+        r = requests.get(url, headers=HEADERS, verify=False, timeout=15)
         if r.status_code == 200 and len(r.content) > 500:
-            return r.content if is_pdf else r.text
+            if not is_pdf or r.content.startswith(b"%PDF"):
+                return r.content if is_pdf else r.text
     except Exception as e:
-        print(f"[!] Direct fetch timed out ({e}), using proxy...")
+        log_status(f"[!] Direct fetch timed out for {url} ({e}), trying proxies...")
 
-    try:
-        proxy_url = f"https://api.allorigins.win/raw?url={quote(url, safe='')}"
-        r = requests.get(proxy_url, headers=HEADERS, timeout=30)
-        if r.status_code == 200 and len(r.content) > 500:
-            return r.content if is_pdf else r.text
-    except Exception as e:
-        print(f"[!] Proxy fetch failed: {e}")
+    proxy_templates = [
+        f"https://api.allorigins.win/raw?url={quote(url, safe='')}",
+        f"https://api.codetabs.com/v1/proxy?quest={quote(url, safe='')}",
+        f"https://corsproxy.io/?{quote(url, safe='')}"
+    ]
 
+    for proxy_url in proxy_templates:
+        try:
+            r = requests.get(proxy_url, headers=HEADERS, timeout=25)
+            if r.status_code == 200 and len(r.content) > 500:
+                if not is_pdf or r.content.startswith(b"%PDF"):
+                    return r.content if is_pdf else r.text
+        except Exception:
+            continue
+
+    log_status(f"❌ All fetch attempts failed for: {url}")
     return None
 
 
 # ================= 5. ZERO-DISK RAM PDF WATERMARKING =================
 def watermark_pdf_in_ram(pdf_bytes):
-    """Applies Top-Center Pill, Bottom-Center Pill, and 45° Upward Center Watermark in RAM."""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for page in doc:
@@ -341,7 +365,6 @@ def watermark_pdf_in_ram(pdf_bytes):
             w, h = rect.width, rect.height
             cx, cy = w / 2.0, h / 2.0
 
-            # 1. Top-Center Rounded Pill Badge
             top_text = "TELEGRAM CHANNEL: @topkeralapsc  |  Click to Join: t.me/topkeralapsc"
             top_fs = 8.5
             top_tw = fitz.get_text_length(top_text, fontname="helv", fontsize=top_fs)
@@ -366,7 +389,6 @@ def watermark_pdf_in_ram(pdf_bytes):
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": top_box, "uri": CHANNEL_URL})
 
-            # 2. Bottom-Center Solid Pill Badge
             bot_text = "JOIN TELEGRAM FOR KERALA PSC UPDATES:  t.me/topkeralapsc  (CLICK HERE)"
             bot_fs = 8.5
             bot_tw = fitz.get_text_length(bot_text, fontname="helv", fontsize=bot_fs)
@@ -391,7 +413,6 @@ def watermark_pdf_in_ram(pdf_bytes):
             )
             page.insert_link({"kind": fitz.LINK_URI, "from": bottom_box, "uri": CHANNEL_URL})
 
-            # 3. Center 45° Upward (/) Diagonal Watermark
             wm_line1 = "TELEGRAM: @topkeralapsc"
             wm_line2 = "https://t.me/topkeralapsc"
             wm_fs = 26
@@ -425,7 +446,7 @@ def watermark_pdf_in_ram(pdf_bytes):
         doc.close()
         return out_bytes
     except Exception as e:
-        print(f"❌ Watermark error: {e}")
+        log_status(f"❌ Watermark error: {e}")
         return pdf_bytes
 
 
@@ -676,7 +697,7 @@ def send_deadline_warning_alert(gaz, post_names_list, days_left):
         )
         time.sleep(2)
     except Exception as e:
-        print(f"[!] Failed to send deadline reminder: {e}")
+        log_status(f"[!] Failed to send deadline reminder: {e}")
 
 
 # ================= 9. STANDARD TABLE SCRAPER =================
@@ -725,10 +746,10 @@ def scrape_table_items(source):
 # ================= 10. ZERO-DISK RAM WATERMARK & SEND =================
 def download_and_send_pdf(item, label, pdf_url):
     try:
-        print(f"[*] Downloading PDF in RAM: {pdf_url}")
+        log_status(f"[*] Downloading PDF in RAM: {pdf_url}")
         pdf_bytes = fetch_url(pdf_url, is_pdf=True)
         if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
-            print(f"[!] Invalid PDF download: {pdf_url}")
+            log_status(f"[!] Invalid PDF download: {pdf_url}")
             return False
 
         watermarked_bytes = watermark_pdf_in_ram(pdf_bytes)
@@ -784,18 +805,23 @@ def download_and_send_pdf(item, label, pdf_url):
             reply_markup=markup
         )
 
-        print(f"[+] Posted from RAM: {custom_filename}")
+        log_status(f"[+] Posted from RAM: {custom_filename}")
         time.sleep(3)
         return True
 
     except Exception as e:
-        print(f"[!] Error sending PDF: {e}")
+        log_status(f"[!] Error sending PDF: {e}")
         return False
 
 
-def run_scraper_cycle():
+def run_scraper_cycle(force_seed=False):
+    if force_seed:
+        log_status("[*] Force Seed triggered! Clearing memory to post fresh sample updates now...")
+        MEMORY_POSTED_LINKS.clear()
+
     is_first_run = len(MEMORY_POSTED_LINKS) == 0
     total_sent = 0
+    log_status(f"[*] Starting scrape cycle (first_run={is_first_run})...")
 
     live_notifications = scrape_notifications_and_send_reminders()
     notif_sent = 0
@@ -811,6 +837,7 @@ def run_scraper_cycle():
 
     for source in SOURCES:
         items = scrape_table_items(source)
+        log_status(f"[*] {source['name']}: Found {len(items)} items.")
         limit = SEED_LIMIT_PER_CATEGORY if is_first_run else 5
         for item in reversed(items[:limit]):
             for label, pdf_url in item["pdfs"]:
@@ -824,31 +851,59 @@ def run_scraper_cycle():
                 if pdf_url not in MEMORY_POSTED_LINKS:
                     save_posted_link(pdf_url)
 
-    print(f"[*] Scrape cycle complete! Total new PDFs sent: {total_sent}")
+    BOT_STATUS["last_scrape_time"] = get_ist_now().strftime("%Y-%m-%d %I:%M:%S %p IST")
+    BOT_STATUS["total_posted_this_session"] += total_sent
+    log_status(f"[*] Scrape cycle complete! Total new PDFs sent: {total_sent}")
+
     if total_sent > 0:
         push_file_to_github_api(HISTORY_FILE, "Sync posted_links.txt [skip ci]")
         push_file_to_github_api(PDF_MAP_FILE, "Sync posted_data.json [skip ci]")
 
 
-# ================= 11. RENDER 24/7 KEEP-ALIVE ENDPOINT =================
+# ================= 11. SINGLE-INSTANCE SYSTEM LOCK & RENDER ENDPOINTS =================
 @app.route("/")
 def keep_alive():
-    return f"Kerala PSC Bot (@{BOT_USERNAME}) is Alive & Listening 24/7! Tracked PDFs: {len(MEMORY_PDF_MAP)}", 200
+    ensure_background_threads_started()
+    return jsonify({
+        "status": "Alive & Listening 24/7",
+        "bot_username": f"@{BOT_USERNAME}",
+        "target_channel": CHAT_ID,
+        "started_at": BOT_STATUS["started_at"],
+        "last_scrape_time": BOT_STATUS["last_scrape_time"],
+        "total_posted_this_session": BOT_STATUS["total_posted_this_session"],
+        "tracked_links_count": len(MEMORY_POSTED_LINKS),
+        "tracked_pdfs_count": len(MEMORY_PDF_MAP),
+        "last_log": BOT_STATUS["last_log"],
+        "force_post_url": "Visit /post_now in your browser to force-post the latest updates immediately!"
+    }), 200
+
+
+@app.route("/post_now")
+def trigger_force_post():
+    ensure_background_threads_started()
+    threading.Thread(target=run_scraper_cycle, kwargs={"force_seed": True}, daemon=True).start()
+    return (
+        "<h2>🚀 Force-Post Triggered!</h2>"
+        "<p>The bot is now scraping and posting the latest watermarked PDFs to <b>@topkeralapsc</b>.</p>"
+        "<p>Check your Telegram channel in 15–30 seconds!</p>"
+    ), 200
 
 
 def background_scraper_loop():
+    time.sleep(10)
     while True:
         try:
-            run_scraper_cycle()
+            run_scraper_cycle(force_seed=False)
         except Exception as e:
-            print(f"[!] Scraper loop error: {e}")
+            log_status(f"[!] Scraper loop error: {e}")
         time.sleep(SCRAPE_INTERVAL_SECONDS)
 
 
 def start_bot_polling():
-    print(f"[*] Starting 24/7 Instant Listener for @{BOT_USERNAME}...")
-    # Wait 5 seconds on boot so any previous Render container during a deploy finishes shutting down
-    time.sleep(5)
+    # Wait 20 seconds after Render port opens so the old deploy container shuts down completely first!
+    log_status(f"[*] Waiting 20s for old Render container to terminate before polling @{BOT_USERNAME}...")
+    time.sleep(20)
+    log_status(f"[*] Starting 24/7 Instant Listener for @{BOT_USERNAME} (Single-Instance Locked)...")
     while True:
         try:
             bot.remove_webhook()
@@ -858,16 +913,40 @@ def start_bot_polling():
                 allowed_updates=["message", "callback_query"]
             )
         except Exception as e:
-            print(f"[!] Polling restart: {e}")
-            time.sleep(5)
+            log_status(f"[!] Polling retry in 10s: {e}")
+            time.sleep(10)
 
+
+def ensure_background_threads_started():
+    """Uses an OS file lock (/tmp/psc_bot.lock) so ONLY ONE worker/thread can ever poll Telegram!"""
+    global LOCK_FILE_HANDLE
+    if BOT_STATUS["threads_started"]:
+        return
+
+    try:
+        LOCK_FILE_HANDLE = open("/tmp/psc_bot_single_instance.lock", "w")
+        fcntl.flock(LOCK_FILE_HANDLE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        # Another worker in the same container already holds the lock! Do not start a duplicate poller.
+        print("[*] Another worker already holds the Telegram polling lock. Skipping duplicate thread.")
+        BOT_STATUS["threads_started"] = True
+        return
+
+    BOT_STATUS["threads_started"] = True
+    BOT_STATUS["started_at"] = get_ist_now().strftime("%Y-%m-%d %I:%M:%S %p IST")
+    init_storage()
+    threading.Thread(target=start_bot_polling, daemon=True).start()
+    threading.Thread(target=background_scraper_loop, daemon=True).start()
+
+
+if os.environ.get("RENDER") or os.environ.get("PORT"):
+    ensure_background_threads_started()
 
 if __name__ == "__main__":
-    init_storage()
     if os.environ.get("RENDER") or os.environ.get("PORT"):
-        threading.Thread(target=start_bot_polling, daemon=True).start()
-        threading.Thread(target=background_scraper_loop, daemon=True).start()
+        ensure_background_threads_started()
         port = int(os.environ.get("PORT", 10000))
-        app.run(host="0.0.0.0", port=port)
+        app.run(host="0.0.0.0", port=port, use_reloader=False)
     else:
+        init_storage()
         run_scraper_cycle()
