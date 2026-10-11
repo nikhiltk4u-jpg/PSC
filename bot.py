@@ -60,7 +60,10 @@ BOT_USERNAME = bot.get_me().username
 app = Flask(__name__)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.keralapsc.gov.in/"
 }
 
 BASE_URL = "https://www.keralapsc.gov.in"
@@ -104,6 +107,7 @@ BOT_STATUS = {
     "started_at": "",
     "last_scrape_time": "Waiting for initial scrape...",
     "total_posted_this_session": 0,
+    "last_ping_time": "None yet",
     "last_log": "Initializing...",
     "threads_started": False
 }
@@ -236,17 +240,25 @@ def send_clean_pdf_to_user_zero_storage(user_id, file_id):
                 bot.delete_message(user_id, status_msg.message_id)
             except Exception:
                 pass
+            return
         except Exception as e:
             log_status(f"[!] Stream send error: {e}")
-    else:
-        dl_markup = InlineKeyboardMarkup()
-        dl_markup.add(InlineKeyboardButton("📥 Click to Open Clean PDF", url=entry["url"]))
-        bot.send_message(
-            user_id,
-            "✅ <b>Verified Subscriber!</b>\nTap below to open your un-watermarked PDF directly:",
-            parse_mode="HTML",
-            reply_markup=dl_markup
-        )
+
+    # Instant direct download button if binary proxy is slow
+    try:
+        bot.delete_message(user_id, status_msg.message_id)
+    except Exception:
+        pass
+    dl_markup = InlineKeyboardMarkup()
+    dl_markup.add(InlineKeyboardButton("📥 Tap Here to Download Clean PDF", url=entry["url"]))
+    bot.send_message(
+        user_id,
+        f"✅ <b>Verified Subscriber of @topkeralapsc!</b>\n\n"
+        f"📌 <b>{entry['title']}</b>\n"
+        f"Tap the button below to download the official un-watermarked PDF directly:",
+        parse_mode="HTML",
+        reply_markup=dl_markup
+    )
 
 
 @bot.message_handler(commands=["start"])
@@ -326,32 +338,55 @@ def get_days_until_deadline(date_str):
         return 999
 
 
-# ================= 4. MULTI-PROXY FETCH =================
+# ================= 4. BINARY-SAFE MULTI-PROXY FETCH =================
 def fetch_url(url, is_pdf=False):
-    try:
-        r = requests.get(url, headers=HEADERS, verify=False, timeout=15)
-        if r.status_code == 200 and len(r.content) > 500:
-            if not is_pdf or r.content.startswith(b"%PDF"):
-                return r.content if is_pdf else r.text
-    except Exception as e:
-        log_status(f"[!] Direct fetch timed out for {url} ({e}), trying proxies...")
+    # Clean accidental /index.php/ in URLs that cause 404/403 on NIC servers
+    clean_target_url = url.replace("/index.php/sites/", "/sites/")
 
-    proxy_templates = [
-        f"https://api.allorigins.win/raw?url={quote(url, safe='')}",
-        f"https://api.codetabs.com/v1/proxy?quest={quote(url, safe='')}",
-        f"https://corsproxy.io/?{quote(url, safe='')}"
+    # 1. Try Direct Connection first
+    try:
+        r = requests.get(clean_target_url, headers=HEADERS, verify=False, timeout=15)
+        if r.status_code == 200 and len(r.content) > 500:
+            if not is_pdf or b"%PDF" in r.content[:1024]:
+                idx = r.content.find(b"%PDF") if is_pdf else 0
+                return r.content[idx:] if is_pdf else r.text
+    except Exception:
+        pass
+
+    # 2. Try Binary-Capable & JSON-Base64 Proxies
+    proxy_list = [
+        ("raw", f"https://api.codetabs.com/v1/proxy?quest={quote(clean_target_url, safe='')}"),
+        ("raw", f"https://api.allorigins.win/raw?url={quote(clean_target_url, safe='')}"),
+        ("json_b64", f"https://api.allorigins.win/get?url={quote(clean_target_url, safe='')}"),
+        ("raw", f"https://thingproxy.freeboard.io/fetch/{clean_target_url}"),
+        ("raw", f"https://corsproxy.io/?{quote(clean_target_url, safe='')}")
     ]
 
-    for proxy_url in proxy_templates:
+    for p_type, proxy_url in proxy_list:
         try:
             r = requests.get(proxy_url, headers=HEADERS, timeout=25)
-            if r.status_code == 200 and len(r.content) > 500:
-                if not is_pdf or r.content.startswith(b"%PDF"):
-                    return r.content if is_pdf else r.text
+            if r.status_code != 200:
+                continue
+
+            if p_type == "json_b64":
+                data = r.json()
+                contents = data.get("contents", "")
+                if "base64," in contents:
+                    raw_bytes = base64.b64decode(contents.split("base64,")[-1])
+                    if is_pdf and b"%PDF" in raw_bytes[:1024]:
+                        return raw_bytes[raw_bytes.find(b"%PDF"):]
+                elif not is_pdf and len(contents) > 500:
+                    return contents
+            else:
+                if is_pdf and b"%PDF" in r.content[:1024]:
+                    idx = r.content.find(b"%PDF")
+                    return r.content[idx:]
+                elif not is_pdf and len(r.content) > 500:
+                    return r.text
         except Exception:
             continue
 
-    log_status(f"❌ All fetch attempts failed for: {url}")
+    log_status(f"⚠️ Proxy binary download blocked for: {clean_target_url}")
     return None
 
 
@@ -630,8 +665,9 @@ def scrape_notifications_and_send_reminders():
             sub_soup = BeautifulSoup(sub_html, "html.parser")
             for a in sub_soup.find_all("a", href=True):
                 href = a["href"].strip()
-                if ".pdf" in href.lower():
-                    pdf_url = urljoin(BASE_URL, href)
+                # Ignore static footer PDFs like authorised-signatory-1.pdf
+                if ".pdf" in href.lower() and "authorised-signatory" not in href.lower():
+                    pdf_url = urljoin(BASE_URL, href).replace("/index.php/sites/", "/sites/")
                     post_title = clean_text(a.get_text())
                     if not post_title or post_title.lower() == "download":
                         post_title = clean_text(a.parent.get_text()) if a.parent else gaz["gazette_title"]
@@ -714,8 +750,8 @@ def scrape_table_items(source):
         pdf_links = []
         for a in row.find_all("a", href=True):
             href = a["href"].strip()
-            if ".pdf" in href.lower():
-                full_url = urljoin(BASE_URL, href)
+            if ".pdf" in href.lower() and "authorised-signatory" not in href.lower():
+                full_url = urljoin(BASE_URL, href).replace("/index.php/sites/", "/sites/")
                 label = clean_text(a.get_text()) or "Download PDF"
                 pdf_links.append((label, full_url))
 
@@ -743,17 +779,9 @@ def scrape_table_items(source):
     return items
 
 
-# ================= 10. ZERO-DISK RAM WATERMARK & SEND =================
+# ================= 10. ZERO-DISK RAM WATERMARK & SEND (WITH FALLBACK) =================
 def download_and_send_pdf(item, label, pdf_url):
     try:
-        log_status(f"[*] Downloading PDF in RAM: {pdf_url}")
-        pdf_bytes = fetch_url(pdf_url, is_pdf=True)
-        if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
-            log_status(f"[!] Invalid PDF download: {pdf_url}")
-            return False
-
-        watermarked_bytes = watermark_pdf_in_ram(pdf_bytes)
-
         if item["short_tag"] == "JobNotification":
             doc_type_display = "Official Gazette Notification PDF"
         elif "question" in label.lower():
@@ -793,21 +821,51 @@ def download_and_send_pdf(item, label, pdf_url):
         )
         markup.add(btn_unlock_clean, btn_share)
 
-        doc_stream = io.BytesIO(watermarked_bytes)
-        doc_stream.name = custom_filename
+        log_status(f"[*] Downloading PDF in RAM: {pdf_url}")
+        pdf_bytes = fetch_url(pdf_url, is_pdf=True)
 
-        bot.send_document(
-            chat_id=CHAT_ID,
-            document=doc_stream,
-            visible_file_name=custom_filename,
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=markup
-        )
+        if pdf_bytes and pdf_bytes.startswith(b"%PDF"):
+            watermarked_bytes = watermark_pdf_in_ram(pdf_bytes)
+            doc_stream = io.BytesIO(watermarked_bytes)
+            doc_stream.name = custom_filename
 
-        log_status(f"[+] Posted from RAM: {custom_filename}")
-        time.sleep(3)
-        return True
+            bot.send_document(
+                chat_id=CHAT_ID,
+                document=doc_stream,
+                visible_file_name=custom_filename,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=markup
+            )
+            log_status(f"[+] Posted Watermarked PDF from RAM: {custom_filename}")
+            time.sleep(3)
+            return True
+
+        # Fallback: If NIC Firewall blocks all proxy binary downloads, let Telegram fetch the URL or post the card!
+        log_status(f"[*] Trying Telegram direct URL fetch for: {custom_filename}")
+        try:
+            bot.send_document(
+                chat_id=CHAT_ID,
+                document=pdf_url,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=markup
+            )
+            log_status(f"[+] Posted via Telegram URL fetch: {custom_filename}")
+            time.sleep(3)
+            return True
+        except Exception:
+            # Final Fallback: Post the formatted update card with the Force-Subscribe Download button!
+            bot.send_message(
+                chat_id=CHAT_ID,
+                text=caption,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True
+            )
+            log_status(f"[+] Posted formatted notification card: {custom_filename}")
+            time.sleep(3)
+            return True
 
     except Exception as e:
         log_status(f"[!] Error sending PDF: {e}")
@@ -816,8 +874,13 @@ def download_and_send_pdf(item, label, pdf_url):
 
 def run_scraper_cycle(force_seed=False):
     if force_seed:
-        log_status("[*] Force Seed triggered! Clearing memory to post fresh sample updates now...")
+        log_status("[*] Force Seed triggered! Clearing memory & history to post fresh updates now...")
         MEMORY_POSTED_LINKS.clear()
+        if os.path.exists(HISTORY_FILE):
+            try:
+                os.remove(HISTORY_FILE)
+            except Exception:
+                pass
 
     is_first_run = len(MEMORY_POSTED_LINKS) == 0
     total_sent = 0
@@ -864,11 +927,13 @@ def run_scraper_cycle(force_seed=False):
 @app.route("/")
 def keep_alive():
     ensure_background_threads_started()
+    BOT_STATUS["last_ping_time"] = get_ist_now().strftime("%Y-%m-%d %I:%M:%S %p IST")
     return jsonify({
         "status": "Alive & Listening 24/7",
         "bot_username": f"@{BOT_USERNAME}",
         "target_channel": CHAT_ID,
         "started_at": BOT_STATUS["started_at"],
+        "last_google_sheet_ping": BOT_STATUS["last_ping_time"],
         "last_scrape_time": BOT_STATUS["last_scrape_time"],
         "total_posted_this_session": BOT_STATUS["total_posted_this_session"],
         "tracked_links_count": len(MEMORY_POSTED_LINKS),
@@ -884,7 +949,7 @@ def trigger_force_post():
     threading.Thread(target=run_scraper_cycle, kwargs={"force_seed": True}, daemon=True).start()
     return (
         "<h2>🚀 Force-Post Triggered!</h2>"
-        "<p>The bot is now scraping and posting the latest watermarked PDFs to <b>@topkeralapsc</b>.</p>"
+        "<p>Cleared old history and started posting the latest updates to <b>@topkeralapsc</b>.</p>"
         "<p>Check your Telegram channel in 15–30 seconds!</p>"
     ), 200
 
@@ -900,7 +965,6 @@ def background_scraper_loop():
 
 
 def start_bot_polling():
-    # Wait 20 seconds after Render port opens so the old deploy container shuts down completely first!
     log_status(f"[*] Waiting 20s for old Render container to terminate before polling @{BOT_USERNAME}...")
     time.sleep(20)
     log_status(f"[*] Starting 24/7 Instant Listener for @{BOT_USERNAME} (Single-Instance Locked)...")
@@ -918,7 +982,6 @@ def start_bot_polling():
 
 
 def ensure_background_threads_started():
-    """Uses an OS file lock (/tmp/psc_bot.lock) so ONLY ONE worker/thread can ever poll Telegram!"""
     global LOCK_FILE_HANDLE
     if BOT_STATUS["threads_started"]:
         return
@@ -927,7 +990,6 @@ def ensure_background_threads_started():
         LOCK_FILE_HANDLE = open("/tmp/psc_bot_single_instance.lock", "w")
         fcntl.flock(LOCK_FILE_HANDLE, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (IOError, OSError):
-        # Another worker in the same container already holds the lock! Do not start a duplicate poller.
         print("[*] Another worker already holds the Telegram polling lock. Skipping duplicate thread.")
         BOT_STATUS["threads_started"] = True
         return
