@@ -196,41 +196,36 @@ def make_file_id(pdf_url):
     return hashlib.md5(pdf_url.encode("utf-8")).hexdigest()[:10]
 
 
-# ================= 2. POSTER GENERATION & DYNAMIC HASHTAGS =================
+# ================= 2. HD POSTER GENERATION & DYNAMIC HASHTAGS =================
 def get_font(size):
     font_path = "/tmp/Roboto-Black.ttf"
     if not os.path.exists(font_path):
-        try:
-            urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Black.ttf", font_path)
-        except Exception:
-            pass
-    try:
-        return ImageFont.truetype(font_path, size)
-    except Exception:
-        return ImageFont.load_default()
+        try: urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Black.ttf", font_path)
+        except Exception: pass
+    try: return ImageFont.truetype(font_path, size)
+    except Exception: return ImageFont.load_default()
 
 def get_regular_font(size):
     font_path = "/tmp/Roboto-Medium.ttf"
     if not os.path.exists(font_path):
-        try:
-            urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Medium.ttf", font_path)
-        except Exception:
-            pass
-    try:
-        return ImageFont.truetype(font_path, size)
-    except Exception:
-        return ImageFont.load_default()
+        try: urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Medium.ttf", font_path)
+        except Exception: pass
+    try: return ImageFont.truetype(font_path, size)
+    except Exception: return ImageFont.load_default()
+
+def draw_text_with_shadow(draw, pos, text, font, fill_color, shadow_color=(0, 0, 0)):
+    x, y = pos
+    draw.text((x + 3, y + 3), text, font=font, fill=shadow_color)
+    draw.text((x, y), text, font=font, fill=fill_color)
 
 def generate_dynamic_hashtags(post_name, district, short_tag):
     tags = [f"#{short_tag}", "#KeralaPSC"]
-    
     if district:
         if "statewide" in district.lower():
             tags.append("#Statewide")
         else:
             clean_dist = re.sub(r'[^A-Za-z]', '', district)
-            if clean_dist:
-                tags.append(f"#{clean_dist.capitalize()}")
+            if clean_dist: tags.append(f"#{clean_dist.capitalize()}")
 
     clean_post = re.sub(r'\(.*?\)', '', post_name)
     words = re.findall(r'[A-Za-z]+', clean_post)
@@ -243,35 +238,59 @@ def generate_dynamic_hashtags(post_name, district, short_tag):
 
     return " ".join(tags)
 
-def generate_premium_banner(post_name, category, doc_type, out_path="/tmp/banner.jpg"):
-    img = Image.new('RGB', (1000, 500), color=(10, 25, 47))
+def generate_premium_banner(post_name, dept_name, district, category, doc_type, out_path="/tmp/banner.jpg"):
+    # 1280x720 HD Resolution
+    width, height = 1280, 720
+    img = Image.new('RGB', (width, height), color=(10, 15, 34)) # Deep Navy Blue
     draw = ImageDraw.Draw(img)
 
+    # Stylish Background Polygon
+    draw.polygon([(0, 0), (1280, 0), (1280, 720)], fill=(17, 24, 48))
+    
+    # Colorful Top/Bottom Borders
+    draw.rectangle([0, 0, 1280, 15], fill=(255, 193, 7)) # Gold Top
+    draw.rectangle([0, 705, 1280, 720], fill=(0, 212, 161)) # Cyan Bottom
+
+    font_doc = get_font(55)
+    font_post = get_font(85) # Huge Post Name
+    font_sub = get_regular_font(45)
+    font_cat = get_font(75)
+
+    # 1. Logo
     logo_file = "69120.png"
     if os.path.exists(logo_file):
         try:
             logo = Image.open(logo_file).convert("RGBA")
-            logo = logo.resize((150, 150))
-            img.paste(logo, (50, 40), logo)
+            logo = logo.resize((260, 260))
+            img.paste(logo, (980, 50), logo)
         except Exception as e:
             log_status(f"Logo error: {e}")
 
-    font_doc = get_font(50)
-    font_post = get_font(40)
-    font_cat_label = get_regular_font(30)
-    font_cat_num = get_font(55)
+    # 2. Document Type
+    draw_text_with_shadow(draw, (70, 70), str(doc_type).upper(), font_doc, (255, 193, 7))
 
-    draw.text((230, 85), str(doc_type).upper(), fill=(255, 215, 0), font=font_doc)
-    draw.rectangle([50, 220, 950, 223], fill=(255, 255, 255, 80))
+    # 3. Post Name (Huge)
+    wrapped_post = textwrap.fill(str(post_name).upper(), width=24)
+    draw_text_with_shadow(draw, (70, 160), wrapped_post, font_post, (255, 255, 255))
+    
+    lines = wrapped_post.count('\n') + 1
+    y_offset = 160 + (lines * 95) + 40
 
-    wrapped_post = textwrap.fill(str(post_name).upper(), width=40)
-    draw.text((50, 250), wrapped_post, fill=(255, 255, 255), font=font_post)
+    # 4. Department & District
+    if dept_name:
+        wrapped_dept = textwrap.fill(f"Dept: {dept_name}", width=45)
+        draw_text_with_shadow(draw, (70, y_offset), wrapped_dept, font_sub, (186, 203, 230))
+        y_offset += 60 * (wrapped_dept.count('\n') + 1)
+    if district and district.lower() != "statewide":
+        draw_text_with_shadow(draw, (70, y_offset), f"District: {district.upper()}", font_sub, (186, 203, 230))
+        y_offset += 60
 
+    # 5. Category No
     if category:
-        draw.text((50, 410), "CATEGORY NO :", fill=(136, 146, 176), font=font_cat_label)
-        draw.text((290, 395), f"{category}", fill=(0, 255, 204), font=font_cat_num)
+        y_cat = 550 if y_offset < 520 else y_offset + 30
+        draw_text_with_shadow(draw, (70, y_cat), f"CAT NO: {category}", font_cat, (0, 212, 161))
 
-    img.save(out_path)
+    img.save(out_path, quality=100)
     return out_path
 
 
@@ -683,7 +702,7 @@ def scrape_table_items(source):
     return items
 
 
-# ================= 10. ZERO-DISK RAM WATERMARK & SEND (FULL-SIZE BANNER FIRST) =================
+# ================= 10. HD BANNER CREATION & QUOTED SEND LOGIC =================
 def download_and_send_pdf(item, label, pdf_url):
     try:
         if item["short_tag"] == "JobNotification":
@@ -708,9 +727,11 @@ def download_and_send_pdf(item, label, pdf_url):
         cat_no = cat_match.group(1) if cat_match else ""
         dist_match = re.search(r'District:</b>\s*(.*?)(?:\n|$)', formatted_body)
         district = dist_match.group(1) if dist_match else ""
+        dept_match = re.search(r'Department:</b>\s*(.*?)(?:\n|$)', formatted_body)
+        dept_name = dept_match.group(1) if dept_match else ""
         
         dynamic_hash = generate_dynamic_hashtags(extracted_post_name, district, item["short_tag"])
-        banner_img_path = generate_premium_banner(extracted_post_name, cat_no, doc_type_display)
+        banner_img_path = generate_premium_banner(extracted_post_name, dept_name, district, cat_no, doc_type_display)
 
         caption = (
             f"{item['emoji']} <b>KERALA PSC {item['category']}</b>\n"
@@ -737,14 +758,11 @@ def download_and_send_pdf(item, label, pdf_url):
             doc_stream.name = custom_filename
 
             try:
-                # 1. Send the giant premium banner FIRST (no caption so it displays maximum size)
+                # 1. Send the giant HD banner completely blank so it renders HUGE in the chat
                 with open(banner_img_path, "rb") as banner_file:
-                    sent_msg = bot.send_photo(
-                        chat_id=CHAT_ID,
-                        photo=banner_file
-                    )
+                    sent_msg = bot.send_photo(chat_id=CHAT_ID, photo=banner_file)
                 
-                # 2. Reply to that banner with the PDF, description, and buttons
+                # 2. Immediately reply/quote to the giant photo with the PDF, caption, and inline buttons
                 bot.send_document(
                     chat_id=CHAT_ID,
                     document=doc_stream,
@@ -755,11 +773,11 @@ def download_and_send_pdf(item, label, pdf_url):
                     reply_to_message_id=sent_msg.message_id
                 )
             except Exception as e:
-                log_status(f"[!] Split post failed, falling back to standard: {e}")
+                log_status(f"[!] Split post failed, falling back: {e}")
                 bot.send_document(chat_id=CHAT_ID, document=doc_stream, visible_file_name=custom_filename, caption=caption, parse_mode="HTML", reply_markup=markup)
             
             if os.path.exists(banner_img_path): os.remove(banner_img_path)
-            log_status(f"[+] Posted Full-Size Banner + PDF: {custom_filename}")
+            log_status(f"[+] Posted HD Quoted Banner + PDF: {custom_filename}")
             time.sleep(3)
             return True
 
