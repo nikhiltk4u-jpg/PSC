@@ -683,13 +683,19 @@ def scrape_table_items(source):
     return items
 
 
+# ================= 10. ZERO-DISK RAM WATERMARK & SEND (FULL-SIZE BANNER FIRST) =================
 def download_and_send_pdf(item, label, pdf_url):
     try:
-        if item["short_tag"] == "JobNotification": doc_type_display = "Official Gazette Notification PDF"
-        elif "question" in label.lower(): doc_type_display = "Question Paper PDF"
-        elif "answer" in label.lower() or item["short_tag"] == "OMR": doc_type_display = "OMR Answer Key PDF"
-        elif item["short_tag"] == "RankList": doc_type_display = "Ranked List PDF"
-        else: doc_type_display = "Short List PDF"
+        if item["short_tag"] == "JobNotification":
+            doc_type_display = "Official Gazette Notification PDF"
+        elif "question" in label.lower():
+            doc_type_display = "Question Paper PDF"
+        elif "answer" in label.lower() or item["short_tag"] == "OMR":
+            doc_type_display = "OMR Answer Key PDF"
+        elif item["short_tag"] == "RankList":
+            doc_type_display = "Ranked List PDF"
+        else:
+            doc_type_display = "Short List PDF"
 
         formatted_body, extracted_post_name = format_structured_details(item, doc_type_display)
         custom_filename = build_clean_filename(extracted_post_name, item["short_tag"], label)
@@ -730,29 +736,38 @@ def download_and_send_pdf(item, label, pdf_url):
             doc_stream = io.BytesIO(watermarked_bytes)
             doc_stream.name = custom_filename
 
-            # Send single Document post with the custom banner as the thumbnail preview!
             try:
-                with open(banner_img_path, "rb") as thumb_file:
-                    bot.send_document(
+                # 1. Send the giant premium banner FIRST (no caption so it displays maximum size)
+                with open(banner_img_path, "rb") as banner_file:
+                    sent_msg = bot.send_photo(
                         chat_id=CHAT_ID,
-                        document=doc_stream,
-                        thumbnail=thumb_file,
-                        visible_file_name=custom_filename,
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_markup=markup
+                        photo=banner_file
                     )
-            except Exception:
+                
+                # 2. Reply to that banner with the PDF, description, and buttons
+                bot.send_document(
+                    chat_id=CHAT_ID,
+                    document=doc_stream,
+                    visible_file_name=custom_filename,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    reply_to_message_id=sent_msg.message_id
+                )
+            except Exception as e:
+                log_status(f"[!] Split post failed, falling back to standard: {e}")
                 bot.send_document(chat_id=CHAT_ID, document=doc_stream, visible_file_name=custom_filename, caption=caption, parse_mode="HTML", reply_markup=markup)
             
             if os.path.exists(banner_img_path): os.remove(banner_img_path)
-            log_status(f"[+] Posted Single Document with Thumbnail: {custom_filename}")
+            log_status(f"[+] Posted Full-Size Banner + PDF: {custom_filename}")
             time.sleep(3)
             return True
 
-        # Fallbacks
+        # Fallbacks for proxy fetch failures
         try:
-            bot.send_document(chat_id=CHAT_ID, document=pdf_url, caption=caption, parse_mode="HTML", reply_markup=markup)
+            with open(banner_img_path, "rb") as banner_file:
+                sent_msg = bot.send_photo(chat_id=CHAT_ID, photo=banner_file)
+            bot.send_document(chat_id=CHAT_ID, document=pdf_url, caption=caption, parse_mode="HTML", reply_markup=markup, reply_to_message_id=sent_msg.message_id)
             time.sleep(3)
             return True
         except Exception:
@@ -809,7 +824,7 @@ def run_scraper_cycle(force_seed=False):
         push_file_to_github_api(PDF_MAP_FILE, "Sync posted_data.json [skip ci]")
 
 
-# ================= 9. SINGLE-INSTANCE SYSTEM LOCK & RENDER ENDPOINTS =================
+# ================= 11. SINGLE-INSTANCE SYSTEM LOCK & RENDER ENDPOINTS =================
 @app.route("/")
 def keep_alive():
     ensure_background_threads_started()
