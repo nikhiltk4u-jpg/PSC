@@ -5,3 +5,4 @@ PyMuPDF
 urllib3
 flask
 gunicorn
+Pillow
